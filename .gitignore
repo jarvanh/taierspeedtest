@@ -1,0 +1,7 @@
+/taierspeedtest
+/taierspeedtest-*
+*.apk
+*.dex
+__pycache__/
+*.png
+/dist/
