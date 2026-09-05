@@ -10,7 +10,6 @@ import (
 	"os"
 	"regexp"
 	"strings"
-	"time"
 )
 
 const (
@@ -454,15 +453,9 @@ func main() {
 	if *noImage {
 		return
 	}
-	out := fmt.Sprintf("/tmp/taierspeedtest-%d.png", time.Now().Unix())
-	if err := renderReport(info, rows, out, modes); err != nil {
-		fmt.Fprintf(os.Stderr, "%s[!] 出图失败: %v%s\n", yellow, err, nc)
-		return
-	}
-	url, err := uploadImage(out)
+	url, err := publishReport(info, rows, modes)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s[!] 结果图上传失败: %v%s\n", yellow, err, nc)
-		fmt.Fprintf(os.Stderr, "    本地文件 %s\n", out)
+		fmt.Fprintf(os.Stderr, "%s[!] 结果图失败: %v%s\n", yellow, err, nc)
 		return
 	}
 	fmt.Printf("%s结果图%s  %s\n", cyan, nc, url)

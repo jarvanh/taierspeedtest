@@ -44,5 +44,5 @@ git push origin v1.0.0
 ## 说明
 
 - 延迟优先 ICMP Ping，否则 HTTP tcping
-- 结果图会上传到 111666.best
+- 结果图优先 PNG 上传 111666.best；失败则改传 SVG 到 catbox。图中不包含 IP
 - 仅供个人网络质量测试
