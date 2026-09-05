@@ -13,13 +13,13 @@ import (
 )
 
 const (
-	cyan  = "\033[36m"
-	bold  = "\033[1m"
-	green = "\033[32m"
+	cyan   = "\033[36m"
+	bold   = "\033[1m"
+	green  = "\033[32m"
 	yellow = "\033[33m"
-	red   = "\033[31m"
-	dim   = "\033[2m"
-	nc    = "\033[0m"
+	red    = "\033[31m"
+	dim    = "\033[2m"
+	nc     = "\033[0m"
 )
 
 func useColor() bool {

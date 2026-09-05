@@ -2,9 +2,9 @@ package main
 
 import (
 	"bytes"
+	_ "embed"
 	"encoding/json"
 	"fmt"
-	"html"
 	"image"
 	"image/color"
 	"image/draw"
@@ -12,8 +12,8 @@ import (
 	"io"
 	"mime/multipart"
 	"net/http"
+	"net/textproto"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -22,6 +22,9 @@ import (
 	"golang.org/x/image/font/opentype"
 	"golang.org/x/image/math/fixed"
 )
+
+//go:embed fonts/NotoSansSC-subset.otf
+var cjkFontBytes []byte
 
 var (
 	colBG    = color.RGBA{31, 30, 42, 255}
@@ -39,7 +42,7 @@ const (
 	hexOK    = "#87d88d"
 	hexWarn  = "#e6c36a"
 	hexBad   = "#e06c75"
-	fontURL  = "https://cdn.jsdelivr.net/gh/notofonts/noto-cjk@main/Sans/SubsetOTF/SC/NotoSansSC-Regular.otf"
+	host111  = "https://i.111666.best"
 )
 
 func imgSpeedColor(v float64, text string) color.RGBA {
@@ -130,134 +133,31 @@ func reportFills(r ProbeResult, modes []string) []string {
 	return fills
 }
 
-func renderReportSVG(info ClientInfo, rows []ProbeResult, path string, modes []string) error {
-	families, grouped := groupedRows(rows)
-	headers := reportHeaders(modes)
-	nCol := len(headers)
-	colW := 130
-	width := 80 + nCol*colW
-	if width < 640 {
-		width = 640
-	}
-	lineH := 26.0
-	height := 130.0
-	for _, f := range families {
-		height += 40 + lineH*float64(1+len(grouped[f])) + 16
-	}
-
-	xs := make([]int, nCol)
-	for i := 0; i < nCol; i++ {
-		xs[i] = 40 + (i+1)*colW
-		if xs[i] > width-30 {
-			xs[i] = width - 30
-		}
-	}
-
-	var b strings.Builder
-	esc := html.EscapeString
-	fontStack := `"PingFang SC","Microsoft YaHei","Noto Sans CJK SC","Source Han Sans SC","Noto Sans SC",sans-serif`
-	fmt.Fprintf(&b, `<?xml version="1.0" encoding="UTF-8"?>`+"\n")
-	fmt.Fprintf(&b, `<svg xmlns="http://www.w3.org/2000/svg" width="%d" height="%.0f" viewBox="0 0 %d %.0f">`+"\n", width, height, width, height)
-	fmt.Fprintf(&b, `<rect width="100%%" height="100%%" fill="%s"/>`+"\n", hexBG)
-	fmt.Fprintf(&b, `<style>text{font-family:%s;font-size:15px;font-weight:700;dominant-baseline:central}</style>`+"\n", fontStack)
-	fmt.Fprintf(&b, `<text x="%d" y="32" text-anchor="middle" fill="%s" font-size="18">TaierSpeedtest  全球网测</text>`+"\n", width/2, hexTeal)
-	now := time.Now().Format("2006-01-02 15:04:05")
-	fmt.Fprintf(&b, `<text x="%d" y="56" text-anchor="middle" fill="%s" font-size="13">报告时间：%s    出口：%s</text>`+"\n",
-		width/2, hexMuted, esc(now), esc(exitLabel(info)))
-	fmt.Fprintf(&b, `<line x1="40" x2="%d" y1="76" y2="76" stroke="%s" stroke-width="1.5" stroke-dasharray="7 3"/>`+"\n", width-40, hexMuted)
-
-	y := 110.0
-	for _, fam := range families {
-		fmt.Fprintf(&b, `<text x="40" y="%.1f" fill="%s" font-size="16">%s 测速</text>`+"\n", y, hexTeal, esc(fam))
-		y += 28
-		for i, h := range headers {
-			fmt.Fprintf(&b, `<text x="%d" y="%.1f" text-anchor="end" fill="%s">%s</text>`+"\n", xs[i], y, hexTeal, esc(h))
-		}
-		y += lineH
-		for _, r := range grouped[fam] {
-			cells := reportCells(r, modes)
-			fills := reportFills(r, modes)
-			for i := range cells {
-				fmt.Fprintf(&b, `<text x="%d" y="%.1f" text-anchor="end" fill="%s">%s</text>`+"\n", xs[i], y, fills[i], esc(cells[i]))
-			}
-			y += lineH
-		}
-		y += 16
-	}
-	b.WriteString("</svg>\n")
-	return os.WriteFile(path, []byte(b.String()), 0o644)
+func hexToRGBA(h string) color.RGBA {
+	var r, g, b uint8
+	fmt.Sscanf(h, "#%02x%02x%02x", &r, &g, &b)
+	return color.RGBA{r, g, b, 255}
 }
 
-func fontCachePath() string {
-	dir, err := os.UserCacheDir()
-	if err != nil {
-		dir = filepath.Join(os.TempDir(), "taierspeedtest")
+func parseCJKFont() (*opentype.Font, error) {
+	if coll, err := opentype.ParseCollection(cjkFontBytes); err == nil && coll.NumFonts() > 0 {
+		return coll.Font(0)
 	}
-	return filepath.Join(dir, "taierspeedtest", "NotoSansSC-Regular.otf")
+	return opentype.Parse(cjkFontBytes)
 }
 
-func ensureCJKFont() string {
-	candidates := []string{
-		"/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-		"/usr/share/fonts/opentype/noto/NotoSansSC-Regular.otf",
-		"/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
-		"/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-		fontCachePath(),
-	}
-	for _, p := range candidates {
-		if st, err := os.Stat(p); err == nil && st.Size() > 1000 {
-			return p
-		}
-	}
-	dst := fontCachePath()
-	_ = os.MkdirAll(filepath.Dir(dst), 0o755)
-	client := &http.Client{Timeout: 45 * time.Second}
-	resp, err := client.Get(fontURL)
+func loadFace(size float64) (font.Face, error) {
+	f, err := parseCJKFont()
 	if err != nil {
-		return ""
+		return nil, err
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return ""
-	}
-	tmp := dst + ".part"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return ""
-	}
-	_, err = io.Copy(f, resp.Body)
-	_ = f.Close()
-	if err != nil {
-		return ""
-	}
-	if err := os.Rename(tmp, dst); err != nil {
-		return ""
-	}
-	return dst
+	return opentype.NewFace(f, &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull})
 }
 
-func loadFace(path string, size float64) font.Face {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return nil
+func closeFace(face font.Face) {
+	if c, ok := face.(io.Closer); ok {
+		_ = c.Close()
 	}
-	var f *opentype.Font
-	if coll, err := opentype.ParseCollection(b); err == nil && coll.NumFonts() > 0 {
-		f, err = coll.Font(0)
-		if err != nil {
-			return nil
-		}
-	} else {
-		f, err = opentype.Parse(b)
-		if err != nil {
-			return nil
-		}
-	}
-	face, err := opentype.NewFace(f, &opentype.FaceOptions{Size: size, DPI: 72, Hinting: font.HintingFull})
-	if err != nil {
-		return nil
-	}
-	return face
 }
 
 func drawText(img *image.RGBA, face font.Face, x, y int, s string, c color.Color, right bool) {
@@ -272,24 +172,28 @@ func drawText(img *image.RGBA, face font.Face, x, y int, s string, c color.Color
 	d.DrawString(s)
 }
 
-func hexToRGBA(h string) color.RGBA {
-	var r, g, b uint8
-	fmt.Sscanf(h, "#%02x%02x%02x", &r, &g, &b)
-	return color.RGBA{r, g, b, 255}
-}
-
 func renderReportPNG(info ClientInfo, rows []ProbeResult, path string, modes []string) error {
-	fontPath := ensureCJKFont()
-	if fontPath == "" {
-		return fmt.Errorf("无中文字体")
+	titleF, err := loadFace(18)
+	if err != nil {
+		return fmt.Errorf("字体: %w", err)
 	}
-	titleF := loadFace(fontPath, 18)
-	headF := loadFace(fontPath, 16)
-	cellF := loadFace(fontPath, 15)
-	smallF := loadFace(fontPath, 13)
-	if titleF == nil || cellF == nil {
-		return fmt.Errorf("无法解析字体")
+	defer closeFace(titleF)
+	headF, err := loadFace(16)
+	if err != nil {
+		return err
 	}
+	defer closeFace(headF)
+	cellF, err := loadFace(14)
+	if err != nil {
+		return err
+	}
+	defer closeFace(cellF)
+	smallF, err := loadFace(13)
+	if err != nil {
+		return err
+	}
+	defer closeFace(smallF)
+
 	families, grouped := groupedRows(rows)
 	headers := reportHeaders(modes)
 	nCol := len(headers)
@@ -299,7 +203,7 @@ func renderReportPNG(info ClientInfo, rows []ProbeResult, path string, modes []s
 		width = 720
 	}
 	lineH := 26
-	h := 140
+	h := 150
 	for _, f := range families {
 		h += 40 + lineH*(1+len(grouped[f])) + 16
 	}
@@ -308,15 +212,15 @@ func renderReportPNG(info ClientInfo, rows []ProbeResult, path string, modes []s
 
 	d := &font.Drawer{Face: titleF}
 	title := "TaierSpeedtest  全球网测"
-	drawText(img, titleF, (width-d.MeasureString(title).Round())/2, 48, title, colTeal, false)
+	drawText(img, titleF, (width-d.MeasureString(title).Round())/2, 44, title, colTeal, false)
 	now := time.Now().Format("2006-01-02 15:04:05")
 	sub := fmt.Sprintf("报告时间：%s    出口：%s", now, exitLabel(info))
 	d.Face = smallF
-	drawText(img, smallF, (width-d.MeasureString(sub).Round())/2, 72, sub, colMuted, false)
+	drawText(img, smallF, (width-d.MeasureString(sub).Round())/2, 68, sub, colMuted, false)
 	for x := 40; x < width-40; x += 10 {
 		for i := 0; i < 7 && x+i < width-40; i++ {
-			img.Set(x+i, 88, colMuted)
-			img.Set(x+i, 89, colMuted)
+			img.Set(x+i, 84, colMuted)
+			img.Set(x+i, 85, colMuted)
 		}
 	}
 
@@ -327,7 +231,7 @@ func renderReportPNG(info ClientInfo, rows []ProbeResult, path string, modes []s
 			xs[i] = width - 30
 		}
 	}
-	y := 120
+	y := 116
 	for _, fam := range families {
 		drawText(img, headF, 40, y, fam+" 测速", colTeal, false)
 		y += 28
@@ -345,25 +249,16 @@ func renderReportPNG(info ClientInfo, rows []ProbeResult, path string, modes []s
 		}
 		y += 16
 	}
+	d.Face = smallF
+	foot := "github.com/MiaM1ku/taierspeedtest"
+	drawText(img, smallF, (width-d.MeasureString(foot).Round())/2, h-18, foot, colMuted, false)
+
 	f, err := os.Create(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	return png.Encode(f, img)
-}
-
-func convertSVGToPNG(svgPath, pngPath string) error {
-	cmd := exec.Command("convert", "-background", hexBG, svgPath, pngPath)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("convert: %v %s", err, string(out))
-	}
-	st, err := os.Stat(pngPath)
-	if err != nil || st.Size() < 100 {
-		return fmt.Errorf("convert 未生成有效 PNG")
-	}
-	return nil
 }
 
 func authToken() (string, error) {
@@ -380,15 +275,28 @@ func authToken() (string, error) {
 	}
 	tok := fmt.Sprintf("%x%x", time.Now().UnixNano(), os.Getpid())
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
-		return "", err
+		return tok, nil
 	}
-	if err := os.WriteFile(p, []byte(tok+"\n"), 0o600); err != nil {
-		return "", err
-	}
+	_ = os.WriteFile(p, []byte(tok+"\n"), 0o600)
 	return tok, nil
 }
 
-func postMultipart(url, field, path string, headers map[string]string) ([]byte, error) {
+func mimeByExt(path string) string {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".gif":
+		return "image/gif"
+	case ".webp":
+		return "image/webp"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+func postMultipart(url, field, path string, extra map[string]string, headers map[string]string) ([]byte, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -396,7 +304,15 @@ func postMultipart(url, field, path string, headers map[string]string) ([]byte, 
 	defer f.Close()
 	var buf bytes.Buffer
 	w := multipart.NewWriter(&buf)
-	fw, err := w.CreateFormFile(field, filepath.Base(path))
+	for k, v := range extra {
+		if err := w.WriteField(k, v); err != nil {
+			return nil, err
+		}
+	}
+	h := make(textproto.MIMEHeader)
+	h.Set("Content-Disposition", fmt.Sprintf(`form-data; name="%s"; filename="%s"`, field, filepath.Base(path)))
+	h.Set("Content-Type", mimeByExt(path))
+	fw, err := w.CreatePart(h)
 	if err != nil {
 		return nil, err
 	}
@@ -404,22 +320,40 @@ func postMultipart(url, field, path string, headers map[string]string) ([]byte, 
 		return nil, err
 	}
 	ctype := w.FormDataContentType()
-	_ = w.Close()
+	if err := w.Close(); err != nil {
+		return nil, err
+	}
 	req, err := http.NewRequest(http.MethodPost, url, &buf)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", ctype)
+	req.Header.Set("User-Agent", "TaierSpeedtest/"+version)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	client := &http.Client{Timeout: 30 * time.Second}
+	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("HTTP %d %s", resp.StatusCode, truncate(string(body), 180))
+	}
+	return body, nil
+}
+
+func truncate(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }
 
 func upload111666(path string) (string, error) {
@@ -427,101 +361,79 @@ func upload111666(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	body, err := postMultipart("https://i.111666.best/image", "image", path, map[string]string{"Auth-Token": token})
+	body, err := postMultipart(host111+"/image", "image", path, nil, map[string]string{"Auth-Token": token})
 	if err != nil {
 		return "", err
 	}
 	var data map[string]any
 	if err := json.Unmarshal(body, &data); err != nil {
-		return "", fmt.Errorf("111666 返回: %s", string(body))
+		return "", fmt.Errorf("返回: %s", truncate(string(body), 180))
 	}
-	if ok, _ := data["ok"].(bool); !ok && data["src"] == nil {
-		return "", fmt.Errorf("111666 拒绝: %s", string(body))
-	}
+	ok, _ := data["ok"].(bool)
 	src, _ := data["src"].(string)
 	if src == "" {
 		src, _ = data["url"].(string)
 	}
-	if src == "" {
-		return "", fmt.Errorf("111666 无地址: %s", string(body))
+	if !ok && src == "" {
+		return "", fmt.Errorf("拒绝: %s", truncate(string(body), 180))
 	}
-	if strings.HasPrefix(src, "http") {
+	if src == "" {
+		return "", fmt.Errorf("无地址: %s", truncate(string(body), 180))
+	}
+	if strings.HasPrefix(src, "http://") || strings.HasPrefix(src, "https://") {
 		return src, nil
 	}
 	if !strings.HasPrefix(src, "/") {
 		src = "/" + src
 	}
-	return "https://i.111666.best" + src, nil
+	return host111 + src, nil
 }
 
 func uploadCatbox(path string) (string, error) {
-	f, err := os.Open(path)
+	body, err := postMultipart("https://catbox.moe/user/api.php", "fileToUpload", path, map[string]string{"reqtype": "fileupload"}, nil)
 	if err != nil {
 		return "", err
 	}
-	defer f.Close()
-	var buf bytes.Buffer
-	w := multipart.NewWriter(&buf)
-	_ = w.WriteField("reqtype", "fileupload")
-	fw, err := w.CreateFormFile("fileToUpload", filepath.Base(path))
-	if err != nil {
-		return "", err
-	}
-	if _, err := io.Copy(fw, f); err != nil {
-		return "", err
-	}
-	ctype := w.FormDataContentType()
-	_ = w.Close()
-	req, err := http.NewRequest(http.MethodPost, "https://catbox.moe/user/api.php", &buf)
-	if err != nil {
-		return "", err
-	}
-	req.Header.Set("Content-Type", ctype)
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-	u := strings.TrimSpace(string(b))
+	u := strings.TrimSpace(string(body))
 	if !strings.HasPrefix(u, "http") {
-		return "", fmt.Errorf("catbox: %s", u)
+		return "", fmt.Errorf("%s", truncate(u, 180))
+	}
+	return u, nil
+}
+
+func upload0x0(path string) (string, error) {
+	body, err := postMultipart("https://0x0.st", "file", path, nil, map[string]string{"Accept": "text/plain"})
+	if err != nil {
+		return "", err
+	}
+	u := strings.TrimSpace(string(body))
+	if !strings.HasPrefix(u, "http") {
+		return "", fmt.Errorf("%s", truncate(u, 180))
 	}
 	return u, nil
 }
 
 func publishReport(info ClientInfo, rows []ProbeResult, modes []string) (string, error) {
-	stamp := time.Now().Unix()
-	svgPath := fmt.Sprintf("/tmp/taierspeedtest-%d.svg", stamp)
-	pngPath := fmt.Sprintf("/tmp/taierspeedtest-%d.png", stamp)
-	if err := renderReportSVG(info, rows, svgPath, modes); err != nil {
-		return "", err
+	dir := os.TempDir()
+	pngPath := filepath.Join(dir, fmt.Sprintf("taierspeedtest-%d.png", time.Now().Unix()))
+	if err := renderReportPNG(info, rows, pngPath, modes); err != nil {
+		return "", fmt.Errorf("渲染 PNG 失败: %w", err)
 	}
-	pngOK := renderReportPNG(info, rows, pngPath, modes) == nil
-	if !pngOK {
-		pngOK = convertSVGToPNG(svgPath, pngPath) == nil
+	type up struct {
+		name string
+		fn   func(string) (string, error)
 	}
-
 	var errs []string
-	if pngOK {
-		if u, err := upload111666(pngPath); err == nil {
-			return u, nil
-		} else {
-			errs = append(errs, "111666: "+err.Error())
+	for _, u := range []up{
+		{"111666", upload111666},
+		{"catbox", uploadCatbox},
+		{"0x0", upload0x0},
+	} {
+		url, err := u.fn(pngPath)
+		if err == nil {
+			return url, nil
 		}
-		if u, err := uploadCatbox(pngPath); err == nil {
-			return u, nil
-		} else {
-			errs = append(errs, "catbox png: "+err.Error())
-		}
-	} else {
-		errs = append(errs, "png 渲染失败，改传 SVG")
+		errs = append(errs, u.name+": "+err.Error())
 	}
-	if u, err := uploadCatbox(svgPath); err == nil {
-		return u, nil
-	} else {
-		errs = append(errs, "catbox svg: "+err.Error())
-	}
-	return "", fmt.Errorf("%s；本地 SVG: %s", strings.Join(errs, "；"), svgPath)
+	return "", fmt.Errorf("%s；本地 PNG: %s", strings.Join(errs, "；"), pngPath)
 }
