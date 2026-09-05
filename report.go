@@ -170,10 +170,10 @@ func renderReport(info ClientInfo, rows []ProbeResult, path string, modes []stri
 
 	headers := []string{"节点", "延迟"}
 	if showS {
-		headers = append(headers, "单线程回程", "单线程去程")
+		headers = append(headers, "单线程上传", "单线程下载")
 	}
 	if showM {
-		headers = append(headers, "多线程回程", "多线程去程")
+		headers = append(headers, "多线程上传", "多线程下载")
 	}
 
 	for _, fam := range families {

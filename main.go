@@ -132,10 +132,10 @@ func cell(text string, v float64, w int) string {
 func printHeader(family string, modes []string) {
 	parts := []string{c(cyan, padLeft(12, family)), c(cyan, padLeft(8, "延迟"))}
 	if contains(modes, "single") {
-		parts = append(parts, c(cyan, padLeft(12, "单线程回程")), c(cyan, padLeft(12, "单线程去程")))
+		parts = append(parts, c(cyan, padLeft(12, "单线程上传")), c(cyan, padLeft(12, "单线程下载")))
 	}
 	if contains(modes, "multi") {
-		parts = append(parts, c(cyan, padLeft(12, "多线程回程")), c(cyan, padLeft(12, "多线程去程")))
+		parts = append(parts, c(cyan, padLeft(12, "多线程上传")), c(cyan, padLeft(12, "多线程下载")))
 	}
 	fmt.Println("  " + strings.Join(parts, "  "))
 }

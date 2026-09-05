@@ -43,7 +43,6 @@ git push origin v1.0.0
 
 ## 说明
 
-- 回程 = 上传，去程 = 下载
 - 延迟优先 ICMP Ping，否则 HTTP tcping
 - 结果图会上传到 111666.best
 - 仅供个人网络质量测试
