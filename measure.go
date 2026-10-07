@@ -85,7 +85,7 @@ func usingProxy() bool {
 // 它就会退化成直连，测出来的不是经代理节点的真实延迟。
 // 改用 http.Client 后走 HTTP_PROXY，经代理的隧道握手才是端到端真实 RTT。
 func httpTcpingMS(ip string, port, count int) float64 {
-	client := newHTTPClient(5 * time.Second)
+	client := newHTTPClient(5*time.Second, false) // 延迟测量：每次新建连接，测的就是握手往返
 	u := "http://" + hostPort(ip, port) + "/speed/"
 	var samples []float64
 	for i := 0; i < count+1; i++ {
@@ -149,11 +149,14 @@ func hasIPv6Internet() bool {
 // 客户端 Write() 几乎不阻塞 —— 上行读数实测虚高 756 倍（见 ampdemo 验证）。
 // 走 HTTP_PROXY 时 mihomo 是标准 TCP accept：转不动就不读，
 // TCP 窗口关闭、反压直接传导回客户端，写多快取决于真实出口速率。
-func newHTTPClient(timeout time.Duration) *http.Client {
+// keepAlive=true 时复用连接（循环上传用）：避免每个请求都重新 TCP 握手。
+func newHTTPClient(timeout time.Duration, keepAlive bool) *http.Client {
 	tr := &http.Transport{
 		Proxy:               http.ProxyFromEnvironment,
 		ForceAttemptHTTP2:   false, // 测速要稳定单流行为，避免 HTTP/2 多路复用干扰
-		DisableKeepAlives:   true,
+		// 循环上传必须复用：每次新建连接会为每 1MB 请求付出一次完整握手（经代理 ~400ms），
+		// 把上行锁死在「每秒 1 个 1MB 请求」= 8.39Mbps 的量子化台阶上。
+		DisableKeepAlives:   !keepAlive,
 		// 关键：Go http.Client 会自动附加 "Accept-Encoding: gzip"，泰尔 WAF 实测对此回 403
 		// （原版裸 socket 下载从不发此头；归因探针 proxied/direct 双 403 同页佐证）。
 		DisableCompression:  true,
@@ -277,7 +280,7 @@ func downloadWorker(ctx context.Context, s Server, uuid string, counter *byteCou
 	req.Header.Set("Connection", "close")
 
 	// 走 http.Client 而非裸 socket：HTTP_PROXY 生效，不再需要 TUN 接管。
-	resp, err := newHTTPClient(0).Do(req)
+	resp, err := newHTTPClient(0, false).Do(req)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[debug-dl] do: %v\n", err)
 		return
@@ -349,6 +352,11 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		contentLen = 900000000 // 上游谎言模式（仅对照；经代理会被 RST）
 	}
 
+	// ⚠️ 循环上传**共享同一个 client**：连接复用生效的前提是同一个 Transport/连接池。
+	// 若每个请求新建 client，即便 DisableKeepAlives=false 也各自建池、照样重新握手 ——
+	// 上行仍会被锁死在「每秒 1 个 1MB 请求」= 8.39Mbps 的量子化台阶上。
+	upClient := newHTTPClient(0, true)
+
 	oneShot := func(idx int) bool {
 		body := &uploadBody{
 			counter: counter,
@@ -372,7 +380,7 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		req.Header.Set("Content-Type", "multipart/form-data;boundary="+boundary)
 		req.ContentLength = contentLen
 
-		resp, err := newHTTPClient(0).Do(req)
+		resp, err := upClient.Do(req)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "[debug-ul] #%d do: %v\n", idx, err)
 			return false
