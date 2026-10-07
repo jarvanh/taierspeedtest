@@ -243,13 +243,28 @@ func enqueue(s Server, imei string, bandwidth int) (string, error) {
 		if strings.HasPrefix(body, "-1") {
 			return "", fmt.Errorf("dovalid 参数错误")
 		}
-		if len(body) > 2 {
-			return body[2:], nil
+		// ⚠️ 只认 "1-<uuid>" 这一种成功形态。原实现是「非 0/2/-1 前缀且长度>2
+		// 就 body[2:] 当 uuid」—— dovalid 一旦被 WAF 拦下返回 403 HTML，那段
+		// HTML 会被当成 uuid 塞进 Key 请求头，触发
+		// net/http: invalid header field value for "Key"（实测 71 连败）。
+		// 校验形态能把这个静默退化变成明确的 enqueue 失败，便于上层重试/跳过。
+		if strings.HasPrefix(body, "1-") {
+			return strings.TrimSpace(body[2:]), nil
 		}
+		return "", fmt.Errorf("dovalid 返回非预期形态: %s", truncateForLog(body, 60))
 	}
 	return "", fmt.Errorf("enqueue 失败: %s", last)
 }
 
 func dequeue(s Server, uuid string) {
 	_, _ = httpPost("http://"+hostPort(s.HostIP, s.Port)+"/speed/dovalid?key="+uuid, 5*time.Second)
+}
+
+func truncateForLog(s string, n int) string {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\n", " ")
+	if len(s) > n {
+		return s[:n] + "..."
+	}
+	return s
 }
