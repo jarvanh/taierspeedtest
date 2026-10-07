@@ -5,11 +5,18 @@ import (
 	"context"
 	"crypto/rand"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
+	"net/url"
+	"os"
 	"os/exec"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+
+	"golang.org/x/net/proxy"
 	"sync/atomic"
 	"time"
 )
@@ -59,27 +66,40 @@ func icmpPingMS(ip string, count int) float64 {
 	return sum / float64(len(times))
 }
 
+// usingProxy 判断当前是否走了显式 HTTP 代理。
+//
+// 走代理时 ICMP 测的是「runner → 测速服务器」的直连延迟，完全不经过代理节点，
+// 会严重误导（看起来很快、实际经节点很慢），必须改用经代理的 HTTP 往返测延迟。
+func usingProxy() bool {
+	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "TAIER_SOCKS5"} {
+		if os.Getenv(k) != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// httpTcpingMS 经 http.Client 测「到测速服务器」的往返延迟。
+//
+// 原实现是裸 socket 握手，在 TUN 下靠路由劫持才走代理；一旦弃用 TUN，
+// 它就会退化成直连，测出来的不是经代理节点的真实延迟。
+// 改用 http.Client 后走 HTTP_PROXY，经代理的隧道握手才是端到端真实 RTT。
 func httpTcpingMS(ip string, port, count int) float64 {
-	req := []byte(fmt.Sprintf("GET / HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", hostPort(ip, port)))
+	client := newHTTPClient(5 * time.Second)
+	u := "http://" + hostPort(ip, port) + "/speed/"
 	var samples []float64
 	for i := 0; i < count+1; i++ {
 		t0 := time.Now()
-		c, err := net.DialTimeout("tcp", hostPort(ip, port), 2*time.Second)
-		if err != nil {
-			time.Sleep(50 * time.Millisecond)
-			continue
-		}
-		_ = c.SetDeadline(time.Now().Add(2 * time.Second))
-		_, err = c.Write(req)
-		if err != nil {
-			_ = c.Close()
-			continue
-		}
-		buf := make([]byte, 64)
-		n, err := c.Read(buf)
-		_ = c.Close()
-		if err == nil && n > 0 {
-			samples = append(samples, float64(time.Since(t0).Microseconds())/1000.0)
+		req, err := http.NewRequest(http.MethodGet, u, nil)
+		if err == nil {
+			req.Header.Set("User-Agent", uaDalvik)
+			if resp, err := client.Do(req); err == nil {
+				_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 64))
+				_ = resp.Body.Close()
+				if resp.StatusCode < 500 {
+					samples = append(samples, float64(time.Since(t0).Microseconds())/1000.0)
+				}
+			}
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -90,6 +110,7 @@ func httpTcpingMS(ip string, port, count int) float64 {
 		return samples[0]
 	}
 	sum := 0.0
+	// 丢弃第一次：含连接建立等一次性开销
 	for _, v := range samples[1:] {
 		sum += v
 	}
@@ -97,8 +118,10 @@ func httpTcpingMS(ip string, port, count int) float64 {
 }
 
 func measureLatency(ip string, port int) float64 {
-	if rtt := icmpPingMS(ip, 4); rtt > 0.1 {
-		return rtt
+	if !usingProxy() {
+		if rtt := icmpPingMS(ip, 4); rtt > 0.1 {
+			return rtt
+		}
 	}
 	return httpTcpingMS(ip, port, 4)
 }
@@ -116,162 +139,300 @@ func hasIPv6Internet() bool {
 	return true
 }
 
+// newHTTPClient 构造一个「吃环境变量代理」的 HTTP 客户端。
+//
+// 这是弃用 TUN 的关键：数据面（上传/下载/延迟）原本是裸 socket 直连，
+// 只能靠 mihomo TUN 靠路由劫持接管；改成标准 http.Client 后，
+// HTTP_PROXY/HTTPS_PROXY 直接生效，不必再开 TUN。
+//
+// 为什么要弃 TUN：mihomo 的 TUN 用户态协议栈（gvisor）会贪婪收包并本地回 ACK，
+// 客户端 Write() 几乎不阻塞 —— 上行读数实测虚高 756 倍（见 ampdemo 验证）。
+// 走 HTTP_PROXY 时 mihomo 是标准 TCP accept：转不动就不读，
+// TCP 窗口关闭、反压直接传导回客户端，写多快取决于真实出口速率。
+func newHTTPClient(timeout time.Duration) *http.Client {
+	tr := &http.Transport{
+		Proxy:               http.ProxyFromEnvironment,
+		ForceAttemptHTTP2:   false, // 测速要稳定单流行为，避免 HTTP/2 多路复用干扰
+		DisableKeepAlives:   true,
+		// 关键：Go http.Client 会自动附加 "Accept-Encoding: gzip"，泰尔 WAF 实测对此回 403
+		// （原版裸 socket 下载从不发此头；归因探针 proxied/direct 双 403 同页佐证）。
+		DisableCompression:  true,
+		TLSHandshakeTimeout: 10 * time.Second,
+		DialContext: (&net.Dialer{
+			Timeout:   8 * time.Second,
+			KeepAlive: 0,
+		}).DialContext,
+	}
+	// SOCKS5 隧道优先（TAIER_SOCKS5=host:port，mihomo mixed-port 同端口支持）。
+	// 为什么不用 HTTP_PROXY 发数据面：HTTP 代理模式下 Go 发 absolute-form 请求行
+	// （GET http://ip:port/path HTTP/1.1），泰尔服务端实测回 403；
+	// SOCKS5 隧道里客户端以 origin-form（GET /path）直连目标，与 TUN 语义完全一致。
+	if socks := os.Getenv("TAIER_SOCKS5"); socks != "" {
+		if d, err := proxy.SOCKS5("tcp", socks, nil, proxy.Direct); err == nil {
+			tr.Proxy = nil
+			if cd, ok := d.(proxy.ContextDialer); ok {
+				tr.DialContext = cd.DialContext
+			} else {
+				tr.Dial = d.Dial
+			}
+		}
+	}
+	return &http.Client{Timeout: timeout, Transport: tr}
+}
+
 type byteCounter struct {
 	n atomic.Int64
 }
 
-func (c *byteCounter) add(n int) { c.n.Add(int64(n)) }
+func newByteCounter(_ int) *byteCounter { return &byteCounter{} }
+
+func (c *byteCounter) add(n int)   { c.n.Add(int64(n)) }
 func (c *byteCounter) snap() int64 { return c.n.Load() }
 
-func parseHTTPHeader(buf []byte) (code int, bodyOff int, ok bool) {
-	idx := strings.Index(string(buf), "\r\n\r\n")
-	if idx < 0 {
-		return 0, 0, false
+// uploadBody 作为 HTTP 请求体喂给 http.NewRequest。
+//
+// 计数发生在 Read() 里 —— Go 传输层按「对端 TCP 窗口实际能吞多少」来读 body，
+// 链路堵住就不再读，计数自然停在真实进度上（反压直接传导，无本机缓冲放大）。
+// 这比裸 socket 的 Write() 盲写准得多：Write() 返回只代表数据进了本机发送缓冲。
+// uploadBody 作为 HTTP 请求体喂给 http.NewRequest。
+//
+// 计数发生在 Read() 里 —— 走标准反压代理（mihomo HTTP/SOCKS5）时，
+// 传输层按「对端窗口实际能吞多少」来读 body，计数即真实出口速率。
+//
+// 两种模式（finite 区分，绝不能混）：
+//   finite=false：上游谎言模式（Content-Length 900MB，靠 stop 结束）。
+//     实测经代理会被服务端 RST —— 保留只为对照，默认不用。
+//   finite=true ：真实长度模式，发满即 EOF。⚠️ 曾经的爆表元凶：
+//     remaining==0 既是「未初始化的无限模式」又是「已发完」——
+//     两个语义撞在同一个值上，发完后 Read 掉进无限分支狂计数（实测 72万 Mbps）。
+//     现用 exhausted 粘性标志彻底分离两个语义。
+type uploadBody struct {
+	counter   *byteCounter
+	prefix    []byte
+	payload   []byte
+	stop      <-chan struct{}
+	finite    bool
+	remaining int64
+	exhausted bool
+}
+
+func (b *uploadBody) Read(p []byte) (int, error) {
+	if b.exhausted {
+		return 0, io.EOF
 	}
-	first := strings.SplitN(string(buf[:idx]), "\r\n", 2)[0]
-	if !strings.HasPrefix(first, "HTTP/1.") {
-		return 0, 0, false
+	if !b.finite {
+		select {
+		case <-b.stop:
+			return 0, io.EOF
+		default:
+		}
+		n := copy(p, b.payload)
+		b.counter.add(n)
+		return n, nil
 	}
-	fs := strings.Fields(first)
-	if len(fs) < 2 {
-		return 0, 0, false
+	if len(b.prefix) > 0 {
+		n := copy(p, b.prefix)
+		if int64(n) > b.remaining {
+			n = int(b.remaining)
+		}
+		b.prefix = b.prefix[n:]
+		b.remaining -= int64(n)
+		b.counter.add(n)
+		if b.remaining == 0 {
+			b.exhausted = true
+		}
+		return n, nil
 	}
-	fmt.Sscanf(fs[1], "%d", &code)
-	return code, idx + 4, true
+	n := copy(p, b.payload)
+	if int64(n) > b.remaining {
+		n = int(b.remaining)
+	}
+	b.remaining -= int64(n)
+	b.counter.add(n)
+	if b.remaining == 0 {
+		b.exhausted = true
+	}
+	return n, nil
+}
+
+// redactURL 打印用：抹掉 query（key=uuid 是 dovalid 下发的会话凭据，
+// jarvanh/actions 是公开仓库，日志不得泄漏 —— 与上游脚本「公开仓库日志勿泄漏」同规）。
+func redactURL(u *url.URL) string {
+	c := *u
+	if c.RawQuery != "" {
+		c.RawQuery = "key=***&r=…"
+	}
+	return c.String()
 }
 
 func downloadWorker(ctx context.Context, s Server, uuid string, counter *byteCounter) {
 	addr := hostPort(s.HostIP, s.Port)
 	path := fmt.Sprintf("/speed/File(1G).dl?r=%d&key=%s", time.Now().Unix(), uuid)
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\nAccept: */*\r\nConnection: close\r\nUser-Agent: %s\r\nHost:%s\r\n\r\n",
-		path, uaBrowser, addr)
-	c, err := net.DialTimeout("tcp", addr, 8*time.Second)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+addr+path, nil)
 	if err != nil {
 		return
 	}
-	defer c.Close()
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
-	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
-	if _, err := c.Write([]byte(req)); err != nil {
+	req.Header.Set("User-Agent", uaBrowser)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Connection", "close")
+
+	// 走 http.Client 而非裸 socket：HTTP_PROXY 生效，不再需要 TUN 接管。
+	resp, err := newHTTPClient(0).Do(req)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "[debug-dl] do: %v\n", err)
 		return
 	}
-	buf := make([]byte, 0, 8192)
-	tmp := make([]byte, 65536)
-	headerDone := false
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		// 归因实验：同一 URL、同一 uuid、同一时刻，绕过一切代理直连重放一次。
+		// proxied 403 + direct 200 → 节点出口 IP 被服务端封；
+		// 两者都 403 → 服务端侧限制（时段窗口 / key 绑定），与代理实现无关。
+		dreq := req.Clone(context.Background())
+		directTr := &http.Transport{DisableKeepAlives: true}
+		dc, err2 := (&http.Client{Timeout: 15 * time.Second, Transport: directTr}).Do(dreq)
+		if err2 == nil {
+			b2, _ := io.ReadAll(io.LimitReader(dc.Body, 200))
+			fmt.Fprintf(os.Stderr, "[debug-dl] proxied=%d body=%q | direct-replay=%d body=%q | url=%s\n",
+				resp.StatusCode, string(b), dc.StatusCode, string(b2), redactURL(req.URL))
+			dc.Body.Close()
+		} else {
+			fmt.Fprintf(os.Stderr, "[debug-dl] proxied=%d body=%q | direct-replay err=%v | url=%s\n",
+				resp.StatusCode, string(b), err2, redactURL(req.URL))
+		}
+		return
+	}
+	// 计数点是真实收到的数据：resp.Body 读到才算，与链路真实速率一致。
+	buf := make([]byte, 65536)
+	counted := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		_ = c.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, err := c.Read(tmp)
+		n, err := resp.Body.Read(buf)
 		if n > 0 {
-			if !headerDone {
-				buf = append(buf, tmp[:n]...)
-				code, off, ok := parseHTTPHeader(buf)
-				if !ok {
-					if err != nil {
-						return
-					}
-					continue
-				}
-				if code < 200 || code >= 400 {
-					return
-				}
-				if len(buf) > off {
-					counter.add(len(buf) - off)
-				}
-				headerDone = true
-				buf = nil
-			} else {
-				counter.add(n)
-			}
+			counter.add(n)
+			counted = true
 		}
 		if err != nil {
+			if !counted {
+				fmt.Fprintf(os.Stderr, "[debug-dl] read-before-data: %v\n", err)
+			}
 			return
 		}
 	}
 }
 
+// uploadWorker 上行测速：走 http.Client（吃 TAIER_SOCKS5 / HTTP_PROXY）。
+//
+// finite 模式下**循环上传**：单请求发满即结束（服务端 200 = 真实收到），
+// 立即再发下一个直到窗口结束 —— ztelliot 验证过的正确模式。
+// 字节数由 ContentLength 严格界定、服务端逐个确认，杜绝计数爆炸；
+// 也顺带解决「单请求发完后窗口内空转、median 被 0 采样拉爆」的问题。
 func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCounter) {
 	addr := hostPort(s.HostIP, s.Port)
 	fn := time.Now().Format("SPEED_20060102_150405.000")
-	header := fmt.Sprintf(
-		"POST /speed/doAnalsLoad.do HTTP/1.1\r\nConnection: close\r\nCache-Control: no-cache\r\nCharset: UTF-8\r\nKey: %s\r\nContent-Type: multipart/form-data;boundary=%s\r\nUser-Agent: %s\r\nHost: %s\r\nAccept-Encoding: gzip\r\nContent-Length: 900000000\r\n\r\n--%s\r\nContent-Disposition: form-data; name=\"upload\";filename=\"%s\"\r\n\r\n",
-		uuid, boundary, uaUpload, addr, boundary, fn,
-	)
 	payload := make([]byte, 16384)
 	_, _ = rand.Read(payload)
-	c, err := net.DialTimeout("tcp", addr, 8*time.Second)
-	if err != nil {
+
+	upLen := int64(0)
+	if v := os.Getenv("TAIER_UPLOAD_LEN"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			upLen = n
+		}
+	}
+	finite := upLen > 0
+	contentLen := upLen
+	if !finite {
+		contentLen = 900000000 // 上游谎言模式（仅对照；经代理会被 RST）
+	}
+
+	oneShot := func(idx int) bool {
+		body := &uploadBody{
+			counter: counter,
+			prefix: []byte(fmt.Sprintf(
+				"--%s\r\nContent-Disposition: form-data; name=\"upload\";filename=\"%s.%d\"\r\n\r\n",
+				boundary, fn, idx)),
+			payload:   payload,
+			stop:      ctx.Done(),
+			finite:    finite,
+			remaining: upLen,
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+			"http://"+addr+"/speed/doAnalsLoad.do", body)
+		if err != nil {
+			return false
+		}
+		req.Header.Set("User-Agent", uaUpload)
+		req.Header.Set("Charset", "UTF-8")
+		req.Header.Set("Key", uuid)
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Content-Type", "multipart/form-data;boundary="+boundary)
+		req.ContentLength = contentLen
+
+		resp, err := newHTTPClient(0).Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[debug-ul] #%d do: %v\n", idx, err)
+			return false
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		fmt.Fprintf(os.Stderr, "[debug-ul] #%d status=%d body=%q\n", idx, resp.StatusCode, string(b))
+		return resp.StatusCode >= 200 && resp.StatusCode < 400
+	}
+
+	if !finite {
+		oneShot(1)
 		return
 	}
-	defer c.Close()
-	if tc, ok := c.(*net.TCPConn); ok {
-		_ = tc.SetNoDelay(true)
-	}
-	_ = c.SetDeadline(time.Now().Add(30 * time.Second))
-	n, err := c.Write([]byte(header))
-	if err != nil {
-		return
-	}
-	counter.add(n)
-	for {
+	for i := 1; ; i++ {
 		select {
 		case <-ctx.Done():
 			return
 		default:
 		}
-		_ = c.SetWriteDeadline(time.Now().Add(3 * time.Second))
-		n, err := c.Write(payload)
-		if n > 0 {
-			counter.add(n)
-		}
-		if err != nil {
-			return
+		if !oneShot(i) {
+			time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
 		}
 	}
 }
 
-func avgTop3(speeds []float64) float64 {
-	if len(speeds) == 0 {
+// median 取采样中位数。
+// 原实现 avgTop3 是「排序后取最大的 3 个求平均」——只挑峰值，
+// 缓冲造成的瞬时突发必定被选中并当成稳态速率，是读数虚高的放大器。
+// 中位数对孤立尖峰不敏感，能反映窗口内的典型速率。
+func median(vals []float64) float64 {
+	if len(vals) == 0 {
 		return 0
 	}
-	cp := append([]float64(nil), speeds...)
-	for i := 0; i < len(cp); i++ {
-		for j := i + 1; j < len(cp); j++ {
-			if cp[j] < cp[i] {
-				cp[i], cp[j] = cp[j], cp[i]
-			}
-		}
+	cp := append([]float64(nil), vals...)
+	sort.Float64s(cp)
+	n := len(cp)
+	if n%2 == 1 {
+		return cp[n/2]
 	}
-	n := 3
-	if len(cp) < n {
-		n = len(cp)
-	}
-	sum := 0.0
-	for _, v := range cp[len(cp)-n:] {
-		sum += v
-	}
-	return sum / float64(n)
+	return (cp[n/2-1] + cp[n/2]) / 2
 }
 
-func runPhase(s Server, uuid string, down bool, threads, lengthS, intervalMS int) float64 {
+type phaseResult struct {
+	written float64
+}
+
+func runPhase(s Server, uuid string, down bool, threads, lengthS, intervalMS int) phaseResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var counter byteCounter
+	counter := newByteCounter(threads)
 	var wg sync.WaitGroup
 	for i := 0; i < threads; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			if down {
-				downloadWorker(ctx, s, uuid, &counter)
+				downloadWorker(ctx, s, uuid, counter)
 			} else {
-				uploadWorker(ctx, s, uuid, &counter)
+				uploadWorker(ctx, s, uuid, counter)
 			}
 		}()
 		time.Sleep(40 * time.Millisecond)
@@ -314,5 +475,5 @@ func runPhase(s Server, uuid string, down bool, threads, lengthS, intervalMS int
 	case <-done:
 	case <-time.After(1 * time.Second):
 	}
-	return avgTop3(samples)
+	return phaseResult{written: median(samples)}
 }

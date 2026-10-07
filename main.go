@@ -298,15 +298,15 @@ func makeIMEI() string {
 	return "TS" + strings.ToUpper(hex.EncodeToString(b))
 }
 
-func applyMode(r *ProbeResult, mode string, up, down float64) {
-	us, ds := fmtSpeed(up), fmtSpeed(down)
+func applyMode(r *ProbeResult, mode string, up, down phaseResult) {
+	us, ds := fmtSpeed(up.written), fmtSpeed(down.written)
 	if mode == "single" {
 		r.SingleUp, r.SingleDown = us, ds
-		r.SingleUpF, r.SingleDownF = up, down
+		r.SingleUpF, r.SingleDownF = up.written, down.written
 		return
 	}
 	r.MultiUp, r.MultiDown = us, ds
-	r.MultiUpF, r.MultiDownF = up, down
+	r.MultiUpF, r.MultiDownF = up.written, down.written
 }
 
 func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, modes []string, downTh, upTh int, ipv6 bool) ProbeResult {
@@ -317,14 +317,18 @@ func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, mod
 	r := ProbeResult{Region: prov + isp, Family: family, RTT: "-", SingleUp: "-", SingleDown: "-", MultiUp: "-", MultiDown: "-"}
 	servers, err := matchServers(base, ip, prov, city, isp, ipv6)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[debug-flow] matchServers: %v\n", err)
 		return r
 	}
 	s := pickServer(servers, prov, city, isp)
 	if s == nil {
+		fmt.Fprintf(os.Stderr, "[debug-flow] pickServer: 候选 %d 个全部不可用\n", len(servers))
 		return r
 	}
+	fmt.Fprintf(os.Stderr, "[debug-flow] server=%s:%d (%s)\n", s.HostIP, s.Port, s.HostName)
 	uuid, err := enqueue(*s, imei, 200)
 	if err != nil {
+		fmt.Fprintf(os.Stderr, "[debug-flow] enqueue: %v\n", err)
 		return r
 	}
 	defer dequeue(*s, uuid)
@@ -336,6 +340,10 @@ func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, mod
 		}
 		down := runPhase(*s, uuid, true, dth, lengthS, intervalMS)
 		up := runPhase(*s, uuid, false, uth, lengthS, intervalMS)
+		// 数据面已改为 http.Client（吃 HTTP_PROXY）：上传计数发生在 body 的 Read() 里，
+		// 传输层按对端窗口读、链路堵住就停止读，读数即真实出口速率。
+		fmt.Fprintf(os.Stderr, "[probe] mode=%s up=%.2fMbps down=%.2fMbps\n",
+			mode, up.written, down.written)
 		applyMode(&r, mode, up, down)
 	}
 	return r
