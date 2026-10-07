@@ -152,11 +152,11 @@ func hasIPv6Internet() bool {
 // keepAlive=true 时复用连接（循环上传用）：避免每个请求都重新 TCP 握手。
 func newHTTPClient(timeout time.Duration, keepAlive bool) *http.Client {
 	tr := &http.Transport{
-		Proxy:               http.ProxyFromEnvironment,
-		ForceAttemptHTTP2:   false, // 测速要稳定单流行为，避免 HTTP/2 多路复用干扰
+		Proxy:             http.ProxyFromEnvironment,
+		ForceAttemptHTTP2: false, // 测速要稳定单流行为，避免 HTTP/2 多路复用干扰
 		// 循环上传必须复用：每次新建连接会为每 1MB 请求付出一次完整握手（经代理 ~400ms），
 		// 把上行锁死在「每秒 1 个 1MB 请求」= 8.39Mbps 的量子化台阶上。
-		DisableKeepAlives:   !keepAlive,
+		DisableKeepAlives: !keepAlive,
 		// 关键：Go http.Client 会自动附加 "Accept-Encoding: gzip"，泰尔 WAF 实测对此回 403
 		// （原版裸 socket 下载从不发此头；归因探针 proxied/direct 双 403 同页佐证）。
 		DisableCompression:  true,
@@ -203,12 +203,13 @@ func (c *byteCounter) snap() int64 { return c.n.Load() }
 // 传输层按「对端窗口实际能吞多少」来读 body，计数即真实出口速率。
 //
 // 两种模式（finite 区分，绝不能混）：
-//   finite=false：上游谎言模式（Content-Length 900MB，靠 stop 结束）。
-//     实测经代理会被服务端 RST —— 保留只为对照，默认不用。
-//   finite=true ：真实长度模式，发满即 EOF。⚠️ 曾经的爆表元凶：
-//     remaining==0 既是「未初始化的无限模式」又是「已发完」——
-//     两个语义撞在同一个值上，发完后 Read 掉进无限分支狂计数（实测 72万 Mbps）。
-//     现用 exhausted 粘性标志彻底分离两个语义。
+//
+//	finite=false：上游谎言模式（Content-Length 900MB，靠 stop 结束）。
+//	  实测经代理会被服务端 RST —— 保留只为对照，默认不用。
+//	finite=true ：真实长度模式，发满即 EOF。⚠️ 曾经的爆表元凶：
+//	  remaining==0 既是「未初始化的无限模式」又是「已发完」——
+//	  两个语义撞在同一个值上，发完后 Read 掉进无限分支狂计数（实测 72万 Mbps）。
+//	  现用 exhausted 粘性标志彻底分离两个语义。
 type uploadBody struct {
 	counter   *byteCounter
 	prefix    []byte
@@ -395,16 +396,71 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		oneShot(1)
 		return
 	}
-	for i := 1; ; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-		if !oneShot(i) {
-			time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
+	// ── 并发上传（根治「量子化台阶」）──
+	// 旧的串行循环是「发完一个 1MB 包 → 等服务端 200 → 再发下一个」，
+	// 每个周期都含一段**无数据传输**的死时间 ≈RTT。经代理 RTT≈500ms 时
+	// 整条链路每秒只能完成 ~2 个包，读数被锁死在 2×8.39=16.78Mbps，
+	// 与真实带宽无关（实测：限速代理设成 50Mbps，旧实现仍只读到 25.17Mbps，
+	// 且恒为 8.39 的整数倍 —— 台阶特征）。
+	// 并发 N 路后，同一时刻有 N 个包在飞，死时间被重叠掉：
+	// 吞吐 ≈ N × 包长 / RTT，读数不再量子化，随真实带宽连续变化。
+	// ⚠️ 保留定长包是有意的：服务端实测接受 1MB 定长(200)，
+	// 但不响应 chunked 连续流（实测每连接仅走 149 字节后 8 秒超时）。
+	par := uploadParallel()
+	if par <= 1 {
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if !oneShot(i) {
+				time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
+			}
 		}
 	}
+	var wg sync.WaitGroup
+	for w := 0; w < par; w++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			for i := worker + 1; ; i += par {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				if !oneShot(i) {
+					time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+}
+
+// uploadParallel 单 worker 内的并发上传路数（TAIER_UPLOAD_PARALLEL，默认 4）。
+//
+// 它与 -up-threads 是两个正交的放大维度：前者是**每 worker 内**的并发请求数，
+// 后者是 runPhase 起的 worker 数（single 模式固定为 1）。
+//
+// 默认 4 的依据：经代理 RTT≈500ms、单包 1MB 时，串行只有 ~2 包/秒；
+// 4 路并发把排气量抬到 ~8 包/秒 ≈ 67Mbps 的理论上限，足以覆盖常见节点上行，
+// 又不至于把测速服务器压到限频（实测 1MB 包 21 连发全部 200）。
+// 若将来观察到成片 403/限频，调低此值即可，无需改代码。
+func uploadParallel() int {
+	v := strings.TrimSpace(os.Getenv("TAIER_UPLOAD_PARALLEL"))
+	if v == "" {
+		return 4
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 1 {
+		return 1
+	}
+	if n > 16 {
+		return 16
+	}
+	return n
 }
 
 // median 取采样中位数。
