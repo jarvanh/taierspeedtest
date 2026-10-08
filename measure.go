@@ -410,12 +410,17 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		if oneShot(1) {
 			return
 		}
-		// 持续供给失败（历史上有「900MB 谎言经代理被服务端 RST」的记录）：
-		// 回退到定长循环，保证不比现状更差 —— 宁可拿到台阶值，也不能没有值。
-		fmt.Fprintf(os.Stderr, "[debug-ul] 持续供给失败，回退定长循环 1MB\n")
-		upLen = 1048576
-		finite = true
-		contentLen = upLen
+		// 偶发抖动重试一次（仍是持续供给，不产生假值）。
+		time.Sleep(100 * time.Millisecond)
+		if oneShot(2) {
+			return
+		}
+		// 持续供给彻底失败：直接放弃该节点上行（2026-10-08 定案：移除回退保险）。
+		// 原保险：失败回退 1MB 定长循环（历史背景：「900MB 谎言经代理被 RST」时
+		// 宁可拿台阶值也不能没有值）—— 但定长循环读数是「每包一跳」的数包台阶值，
+		// 不是真实带宽，回流订阅会拿假速度误导选路。宁缺毋假：失败就不给值。
+		fmt.Fprintf(os.Stderr, "[debug-ul] 持续供给失败，放弃该节点上行（回退保险已移除）\n")
+		return
 	}
 	// ── 定长循环模式（仅回退：显式设了 TAIER_UPLOAD_LEN 才走）──
 	// ⚠️ 这条路测不出真实带宽 —— 计数是「每包一跳」，节拍由包完成事件定：
