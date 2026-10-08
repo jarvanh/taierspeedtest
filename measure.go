@@ -392,75 +392,48 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		return resp.StatusCode >= 200 && resp.StatusCode < 400
 	}
 
+	// ── 持续供给模式（默认，与下载同构 = 测真实带宽）──
+	// 不设 TAIER_UPLOAD_LEN 即走这里：单个请求撑满整个测速窗口，
+	// body 持续产数据直到 ctx 结束。计数点在 Read()，而 Read() 会被
+	// TCP 反压卡住 —— 计数由真实流量驱动，不再依赖「包完成」事件。
+	// 这与下载 downloadWorker 的 resp.Body.Read() 完全同源，故能测真实带宽。
+	//
+	// 实测判据（可控带宽 SOCKS5 限速代理对照）：
+	//   定长循环包  限速30→67.11  限速60→67.11  ← 两次完全相同，不跟随带宽
+	//               67.11 = 7.999 阶（整阶 = 仍在数包）
+	//   持续供给    限速30→23.20  限速60→37.49  ← 上升 1.62x
+	//               代理真值同步 8.914→14.653 (1.64x)，几乎完全吻合 ✓
+	//
+	// ⚠️ 曾试过 chunked（不声明长度）连续流，服务端不响应
+	//    （实测每连接仅走 149 字节后 8 秒超时），故仍用声明长度的形态。
 	if !finite {
-		oneShot(1)
-		return
+		if oneShot(1) {
+			return
+		}
+		// 持续供给失败（历史上有「900MB 谎言经代理被服务端 RST」的记录）：
+		// 回退到定长循环，保证不比现状更差 —— 宁可拿到台阶值，也不能没有值。
+		fmt.Fprintf(os.Stderr, "[debug-ul] 持续供给失败，回退定长循环 1MB\n")
+		upLen = 1048576
+		finite = true
+		contentLen = upLen
 	}
-	// ── 并发上传（根治「量子化台阶」）──
-	// 旧的串行循环是「发完一个 1MB 包 → 等服务端 200 → 再发下一个」，
-	// 每个周期都含一段**无数据传输**的死时间 ≈RTT。经代理 RTT≈500ms 时
-	// 整条链路每秒只能完成 ~2 个包，读数被锁死在 2×8.39=16.78Mbps，
-	// 与真实带宽无关（实测：限速代理设成 50Mbps，旧实现仍只读到 25.17Mbps，
-	// 且恒为 8.39 的整数倍 —— 台阶特征）。
-	// 并发 N 路后，同一时刻有 N 个包在飞，死时间被重叠掉：
-	// 吞吐 ≈ N × 包长 / RTT，读数不再量子化，随真实带宽连续变化。
-	// ⚠️ 保留定长包是有意的：服务端实测接受 1MB 定长(200)，
-	// 但不响应 chunked 连续流（实测每连接仅走 149 字节后 8 秒超时）。
-	par := uploadParallel()
-	if par <= 1 {
-		for i := 1; ; i++ {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-			}
-			if !oneShot(i) {
-				time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
-			}
+	// ── 定长循环模式（仅回退：显式设了 TAIER_UPLOAD_LEN 才走）──
+	// ⚠️ 这条路测不出真实带宽 —— 计数是「每包一跳」，节拍由包完成事件定：
+	//    小包被 socket 缓冲 + mihomo 缓冲瞬间吞下，Read() 立刻跑完，
+	//    然后干等服务端 200（≈RTT）期间计数完全停摆。
+	//    实测读数恒为 8.39 的整数倍（0/8.39/12.58/16.78/…/67.11/83.89），
+	//    这与「下载值是连续的」形成鲜明对比 —— 是数包而非测速。
+	//    仅当持续供给模式在真实代理链路上出现大面积 RST 时才回退到此。
+	for i := 1; ; i++ {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		if !oneShot(i) {
+			time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
 		}
 	}
-	var wg sync.WaitGroup
-	for w := 0; w < par; w++ {
-		wg.Add(1)
-		go func(worker int) {
-			defer wg.Done()
-			for i := worker + 1; ; i += par {
-				select {
-				case <-ctx.Done():
-					return
-				default:
-				}
-				if !oneShot(i) {
-					time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
-				}
-			}
-		}(w)
-	}
-	wg.Wait()
-}
-
-// uploadParallel 单 worker 内的并发上传路数（TAIER_UPLOAD_PARALLEL，默认 4）。
-//
-// 它与 -up-threads 是两个正交的放大维度：前者是**每 worker 内**的并发请求数，
-// 后者是 runPhase 起的 worker 数（single 模式固定为 1）。
-//
-// 默认 4 的依据：经代理 RTT≈500ms、单包 1MB 时，串行只有 ~2 包/秒；
-// 4 路并发把排气量抬到 ~8 包/秒 ≈ 67Mbps 的理论上限，足以覆盖常见节点上行，
-// 又不至于把测速服务器压到限频（实测 1MB 包 21 连发全部 200）。
-// 若将来观察到成片 403/限频，调低此值即可，无需改代码。
-func uploadParallel() int {
-	v := strings.TrimSpace(os.Getenv("TAIER_UPLOAD_PARALLEL"))
-	if v == "" {
-		return 4
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 1 {
-		return 1
-	}
-	if n > 16 {
-		return 16
-	}
-	return n
 }
 
 // median 取采样中位数。
