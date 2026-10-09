@@ -341,16 +341,28 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 	payload := make([]byte, 16384)
 	_, _ = rand.Read(payload)
 
-	upLen := int64(0)
+	// 声明值决策（2026-10-10 归因探针二分实测，22 节点无一例外）：
+	//   1KB/64KB/1MB/16MB 声明 → 全部有 HTTP 响应（200/400/403），零 RST；
+	//   128MB 声明 → 22/22 write RST 秒断 —— 节点链路网关对大 POST 的阈值在
+	//   16MB~128MB（与 Cloudflare 免费版 100MB 兼容；行为是直接断连而非 413）。
+	//   而 900MB 谎言持续供给（原默认）在机场节点上 100% 秒断 ⇒ 上行恒 0。
+	// 故默认改为 **8MB 有限长度循环**（阈值下留 2 倍余量）：
+	//   - 单请求 8MB：@1MB/s 慢节点 ≈8s > 窗口剩余，等效撑满窗口，无台阶问题；
+	//     快节点 1~3 个请求/窗口，RTT 停摆占比 ≤20%，中位数读数接近真实。
+	//   - 服务端逐个确认（200 = 真实收到），计数与服务端确认挂钩，宁真勿假。
+	// 旧行为保留为对照模式：TAIER_UPLOAD_SUSTAINED=1 → 900MB 谎言持续供给；
+	// TAIER_UPLOAD_LEN=<bytes> → 人工定长循环（原语义不变）。
+	finite := true
+	contentLen := int64(8 << 20)
 	if v := os.Getenv("TAIER_UPLOAD_LEN"); v != "" {
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			upLen = n
+			contentLen = n
 		}
 	}
-	finite := upLen > 0
-	contentLen := upLen
-	if !finite {
-		contentLen = 900000000 // 上游谎言模式（仅对照；经代理会被 RST）
+	switch os.Getenv("TAIER_UPLOAD_SUSTAINED") {
+	case "1", "true", "yes", "on":
+		finite = false
+		contentLen = 900000000
 	}
 
 	// ⚠️ 循环上传**共享同一个 client**：连接复用生效的前提是同一个 Transport/连接池。
@@ -367,7 +379,7 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 			payload:   payload,
 			stop:      ctx.Done(),
 			finite:    finite,
-			remaining: upLen,
+			remaining: contentLen,
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 			"http://"+addr+"/speed/doAnalsLoad.do", body)
@@ -392,20 +404,10 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		return resp.StatusCode >= 200 && resp.StatusCode < 400
 	}
 
-	// ── 持续供给模式（默认，与下载同构 = 测真实带宽）──
-	// 不设 TAIER_UPLOAD_LEN 即走这里：单个请求撑满整个测速窗口，
-	// body 持续产数据直到 ctx 结束。计数点在 Read()，而 Read() 会被
-	// TCP 反压卡住 —— 计数由真实流量驱动，不再依赖「包完成」事件。
-	// 这与下载 downloadWorker 的 resp.Body.Read() 完全同源，故能测真实带宽。
-	//
-	// 实测判据（可控带宽 SOCKS5 限速代理对照）：
-	//   定长循环包  限速30→67.11  限速60→67.11  ← 两次完全相同，不跟随带宽
-	//               67.11 = 7.999 阶（整阶 = 仍在数包）
-	//   持续供给    限速30→23.20  限速60→37.49  ← 上升 1.62x
-	//               代理真值同步 8.914→14.653 (1.64x)，几乎完全吻合 ✓
-	//
-	// ⚠️ 曾试过 chunked（不声明长度）连续流，服务端不响应
-	//    （实测每连接仅走 149 字节后 8 秒超时），故仍用声明长度的形态。
+	// ── 900MB 谎言持续供给（对照模式：TAIER_UPLOAD_SUSTAINED=1 才走）──
+	// 单请求撑满整个测速窗口，body 持续产数据直到 ctx 结束。计数点在 Read()，
+	// 由 TCP 反压驱动，与下载同源 —— 直连（S1/S2、沙箱 A/B）下读数真实。
+	// ⚠️ 但经机场节点 100% 秒断 RST（阈值探针已定案），线上默认已弃用。
 	if !finite {
 		if oneShot(1) {
 			return
@@ -430,13 +432,13 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		uploadAttributionProbe(ctx, s, uuid)
 		return
 	}
-	// ── 定长循环模式（仅回退：显式设了 TAIER_UPLOAD_LEN 才走）──
-	// ⚠️ 这条路测不出真实带宽 —— 计数是「每包一跳」，节拍由包完成事件定：
-	//    小包被 socket 缓冲 + mihomo 缓冲瞬间吞下，Read() 立刻跑完，
-	//    然后干等服务端 200（≈RTT）期间计数完全停摆。
-	//    实测读数恒为 8.39 的整数倍（0/8.39/12.58/16.78/…/67.11/83.89），
-	//    这与「下载值是连续的」形成鲜明对比 —— 是数包而非测速。
-	//    仅当持续供给模式在真实代理链路上出现大面积 RST 时才回退到此。
+	// ── 有限长度循环模式（默认路径：8MB/请求，TAIER_UPLOAD_LEN 可覆盖）──
+	// 单请求发满 8MB 即 EOF、服务端确认，立即再发下一个直到窗口结束。
+	// 为什么不再是"数包台阶"：旧 1MB 小包循环的台阶（8.39Mbps 量子化）根源是
+	// 「包完成事件节拍 + 等确认期间计数停摆」占窗口比例过大；8MB 请求在慢节点
+	// 等效撑满窗口（传输 >> RTT），快节点停摆占比也 ≤20%，中位数读数接近真实。
+	// 失败（服务端 4xx/连接断）退避重试：已计数字节不撤销、不重复造假值，
+	// 窗口内成功请求的真实速率照常进采样。
 	for i := 1; ; i++ {
 		select {
 		case <-ctx.Done():
