@@ -312,13 +312,25 @@ func applyMode(r *ProbeResult, mode string, up, down phaseResult) {
 
 // upStaggerMS 上传线程错峰间隔：多会话模式下让 N 个独立会话先后建立，
 // 摊薄同会话/同 IP 的 POST 请求密度（服务端限次对速率也敏感）。
-func upStaggerMS() int {
+// 高并发（>4 线程）时自适应压缩，保证错峰期 ≤ 窗口 ~20%（13s 窗口）：
+// 8→375ms、16→187ms（下限 100ms），否则 16 连接错峰 8s 会腰斩有效采样期。
+func upStaggerMS(threads int) int {
 	if v := os.Getenv("TAIER_UPLOAD_STAGGER_MS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
 			return n
 		}
 	}
-	return 500
+	if threads <= 1 {
+		return 0
+	}
+	if threads <= 4 {
+		return 500
+	}
+	if ms := 3000 / threads; ms < 100 {
+		return 100
+	} else {
+		return ms
+	}
 }
 
 // threadEnvInt 允许经环境变量覆盖 --down-threads/--up-threads（workflow 侧
@@ -362,7 +374,7 @@ func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, mod
 			dth, uth = 1, 1
 		}
 		down := runPhase(*s, uuid, true, dth, lengthS, intervalMS, 40)
-		up := runPhase(*s, uuid, false, uth, lengthS, intervalMS, upStaggerMS())
+		up := runPhase(*s, uuid, false, uth, lengthS, intervalMS, upStaggerMS(uth))
 		// 数据面已改为 http.Client（吃 HTTP_PROXY）：上传计数发生在 body 的 Read() 里，
 		// 传输层按对端窗口读、链路堵住就停止读，读数即真实出口速率。
 		fmt.Fprintf(os.Stderr, "[probe] mode=%s up=%.2fMbps down=%.2fMbps\n",
