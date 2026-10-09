@@ -457,26 +457,29 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 //
 //	节点对 doAnalsLoad.do 一律断 / 节点只限大 Content-Length / 节点隧道本身已死
 //
-// 三个探测各 ≤4s、用独立 context（不随窗口取消）与独立 dummy counter（不污染读数）：
+// 三个固定探测 + 声明值二分（64KB/1MB/16MB/128MB），各 ≤4s、独立 context（不随窗口
+// 取消）与独立 dummy counter（不污染读数）：
 //
-//	small-proxied : 经 TAIER_SOCKS5/HTTP_PROXY 发 1KB 定长 POST —— RST = 节点对该端点
-//	                一律断；任何 HTTP 响应（含 4xx）= 链路通，断的是大包/持续流
-//	small-direct  : 绕过一切代理直连重放 —— 对照（key 可能因绑定节点出口 IP 而 4xx，
-//	                网络层通断仍是有效信号）
-//	tunnel-get    : 经代理 GET /speed/ —— 区分「节点隧道已死」与「对 POST 挑食」
+//	small-proxied      : 经 TAIER_SOCKS5/HTTP_PROXY 发 1KB 定长 POST —— RST = 节点对该端点
+//	                     一律断；任何 HTTP 响应（含 4xx）= 链路通
+//	len{64KB,1MB,16MB,128MB}-proxied : 递增声明值定位「大上传被断」的阈值 ——
+//	                     RST = 该声明值被断；HTTP 响应 = 放行；写不完超时 = 放行（声明被接受）
+//	small-direct       : 绕过一切代理直连重放 —— 对照（key 可能因绑定节点出口 IP 而 4xx，
+//	                     网络层通断仍是有效信号）
+//	tunnel-get         : 经代理 GET /speed/ —— 区分「节点隧道已死」与「对 POST 挑食」
 func uploadAttributionProbe(ctx context.Context, s Server, uuid string) {
-	pctx, cancel := context.WithTimeout(context.Background(), 16*time.Second)
+	pctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	addr := hostPort(s.HostIP, s.Port)
 	dummy := newByteCounter(1)
-	runSmall := func(label string, client *http.Client) {
+	runSmall := func(label string, client *http.Client, contentLen int64) {
 		body := &uploadBody{
 			counter:   dummy,
 			prefix:    []byte(fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"upload\";filename=\"attr.%s\"\r\n\r\n", boundary, label)),
 			payload:   make([]byte, 4096),
 			stop:      pctx.Done(),
 			finite:    true,
-			remaining: 1024,
+			remaining: contentLen,
 		}
 		req, err := http.NewRequestWithContext(pctx, http.MethodPost, "http://"+addr+"/speed/doAnalsLoad.do", body)
 		if err != nil {
@@ -488,9 +491,10 @@ func uploadAttributionProbe(ctx context.Context, s Server, uuid string) {
 		req.Header.Set("Key", uuid)
 		req.Header.Set("Cache-Control", "no-cache")
 		req.Header.Set("Content-Type", "multipart/form-data;boundary="+boundary)
-		req.ContentLength = 1024
+		req.ContentLength = contentLen
 		resp, err := client.Do(req)
 		if err != nil {
+			// RST/broken pipe = 该声明值被断；timeout = 声明被接受、还在慢写 = 放行
 			fmt.Fprintf(os.Stderr, "[debug-ul-attr] %s err=%v\n", label, err)
 			return
 		}
@@ -498,9 +502,15 @@ func uploadAttributionProbe(ctx context.Context, s Server, uuid string) {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 80))
 		fmt.Fprintf(os.Stderr, "[debug-ul-attr] %s status=%d body=%q\n", label, resp.StatusCode, string(b))
 	}
-	runSmall("small-proxied", newHTTPClient(4*time.Second, false))
+	// 声明值二分：small(1KB) 全通、900MB 全断（2026-10-09 实测），中间档定位阈值。
+	// 判定：RST=断；HTTP 响应（含 4xx）=放行；写不完超时=放行（声明被接受）。
+	runSmall("small-proxied", newHTTPClient(4*time.Second, false), 1024)
+	runSmall("len64KB-proxied", newHTTPClient(4*time.Second, false), 64*1024)
+	runSmall("len1MB-proxied", newHTTPClient(4*time.Second, false), 1<<20)
+	runSmall("len16MB-proxied", newHTTPClient(4*time.Second, false), 16<<20)
+	runSmall("len128MB-proxied", newHTTPClient(4*time.Second, false), 128<<20)
 	runSmall("small-direct", &http.Client{Timeout: 4 * time.Second,
-		Transport: &http.Transport{DisableKeepAlives: true}})
+		Transport: &http.Transport{DisableKeepAlives: true}}, 1024)
 	if req, err := http.NewRequestWithContext(pctx, http.MethodGet, "http://"+addr+"/speed/", nil); err == nil {
 		req.Header.Set("User-Agent", uaDalvik)
 		if resp, err := newHTTPClient(4*time.Second, false).Do(req); err == nil {
