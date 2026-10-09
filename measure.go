@@ -335,7 +335,31 @@ func downloadWorker(ctx context.Context, s Server, uuid string, counter *byteCou
 // 立即再发下一个直到窗口结束 —— ztelliot 验证过的正确模式。
 // 字节数由 ContentLength 严格界定、服务端逐个确认，杜绝计数爆炸；
 // 也顺带解决「单请求发完后窗口内空转、median 被 0 采样拉爆」的问题。
+// enqueueBandwidth 返回 dovalid 会话的 bandwidth 声明值（参与 token 计算）。
+// 实测（2026-10-10）：单连接 8MiB/s 限速档来自**机场节点链路**（直连无此档），
+// 与该参数无映射关系；保留可调仅作排查开关。
+func enqueueBandwidth() int {
+	if v := os.Getenv("TAIER_ENQUEUE_BANDWIDTH"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 200
+}
+
+// uploadWorker(ctx, s, uuid, counter)：uuid 为共享会话；多会话模式（默认开）下
+// 本连接会**独立 enqueue** 换成自己的 uuid —— 服务端对同一会话的并发 POST 有限次
+// 拒绝（multi 4 并发时 up=0 率 43%），每连接独立会话让服务端看到 N 个温和的独立
+// 用户，配合 runPhase 的错峰启动，为加连接数铺路。
 func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCounter) {
+	if os.Getenv("TAIER_UPLOAD_MULTI_SESSION") != "0" {
+		if u2, err := enqueue(s, makeIMEI(), enqueueBandwidth()); err == nil {
+			uuid = u2
+			defer dequeue(s, u2)
+		} else {
+			fmt.Fprintf(os.Stderr, "[debug-ul] multi-session enqueue failed, fallback shared: %v\n", err)
+		}
+	}
 	addr := hostPort(s.HostIP, s.Port)
 	fn := time.Now().Format("SPEED_20060102_150405.000")
 	payload := make([]byte, 16384)
@@ -546,7 +570,7 @@ type phaseResult struct {
 	written float64
 }
 
-func runPhase(s Server, uuid string, down bool, threads, lengthS, intervalMS int) phaseResult {
+func runPhase(s Server, uuid string, down bool, threads, lengthS, intervalMS, staggerMS int) phaseResult {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	counter := newByteCounter(threads)
@@ -561,7 +585,7 @@ func runPhase(s Server, uuid string, down bool, threads, lengthS, intervalMS int
 				uploadWorker(ctx, s, uuid, counter)
 			}
 		}()
-		time.Sleep(40 * time.Millisecond)
+		time.Sleep(time.Duration(staggerMS) * time.Millisecond)
 	}
 	points := (lengthS * 1000) / intervalMS
 	if points < 1 {
