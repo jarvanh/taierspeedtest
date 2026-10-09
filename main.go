@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -309,6 +310,28 @@ func applyMode(r *ProbeResult, mode string, up, down phaseResult) {
 	r.MultiUpF, r.MultiDownF = up.written, down.written
 }
 
+// upStaggerMS 上传线程错峰间隔：多会话模式下让 N 个独立会话先后建立，
+// 摊薄同会话/同 IP 的 POST 请求密度（服务端限次对速率也敏感）。
+func upStaggerMS() int {
+	if v := os.Getenv("TAIER_UPLOAD_STAGGER_MS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return 500
+}
+
+// threadEnvInt 允许经环境变量覆盖 --down-threads/--up-threads（workflow 侧
+// 不需要暴露新 flag；默认值不变，TAIER_UP_THREADS/TAIER_DOWN_THREADS 可调）。
+func threadEnvInt(env string, fallback int) int {
+	if v := os.Getenv(env); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return fallback
+}
+
 func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, modes []string, downTh, upTh int, ipv6 bool) ProbeResult {
 	family := "IPv4"
 	if ipv6 {
@@ -326,7 +349,7 @@ func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, mod
 		return r
 	}
 	fmt.Fprintf(os.Stderr, "[debug-flow] server=%s:%d (%s)\n", s.HostIP, s.Port, s.HostName)
-	uuid, err := enqueue(*s, imei, 200)
+	uuid, err := enqueue(*s, imei, enqueueBandwidth())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[debug-flow] enqueue: %v\n", err)
 		return r
@@ -338,8 +361,8 @@ func runOne(base, ip, prov, city, isp, imei string, lengthS, intervalMS int, mod
 		if mode == "single" {
 			dth, uth = 1, 1
 		}
-		down := runPhase(*s, uuid, true, dth, lengthS, intervalMS)
-		up := runPhase(*s, uuid, false, uth, lengthS, intervalMS)
+		down := runPhase(*s, uuid, true, dth, lengthS, intervalMS, 40)
+		up := runPhase(*s, uuid, false, uth, lengthS, intervalMS, upStaggerMS())
 		// 数据面已改为 http.Client（吃 HTTP_PROXY）：上传计数发生在 body 的 Read() 里，
 		// 传输层按对端窗口读、链路堵住就停止读，读数即真实出口速率。
 		fmt.Fprintf(os.Stderr, "[probe] mode=%s up=%.2fMbps down=%.2fMbps\n",
@@ -437,7 +460,8 @@ func main() {
 				}
 				fmt.Fprintf(os.Stderr, "\r%s  测速进度%s  %d/%d  %s%s%s   ", cyan, nc, done, total, tag, j[0], j[2])
 			}
-			row := runOne(base, info.IP, j[0], j[1], j[2], imei, *duration, *interval, modes, *downTh, *upTh, ipv6)
+			row := runOne(base, info.IP, j[0], j[1], j[2], imei, *duration, *interval, modes,
+				threadEnvInt("TAIER_DOWN_THREADS", *downTh), threadEnvInt("TAIER_UP_THREADS", *upTh), ipv6)
 			rows = append(rows, row)
 			done += len(modes)
 			if !*jsonF {
