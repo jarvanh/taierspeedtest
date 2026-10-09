@@ -410,6 +410,13 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		if oneShot(1) {
 			return
 		}
+		// ⚠️ ctx 已取消 = 测速窗口正常结束（Do 返回 context canceled），不是失败。
+		// 原实现把它当「持续供给失败」误报（2026-10-09 对照实验实锤：成功测出
+		// 125Mbps 的同时 stderr 照打「持续供给失败，放弃该节点上行」），随后的重试
+		// 也只会立刻再次 canceled。窗口结束直接返回，计数已进采样，读数不受影响。
+		if ctx.Err() != nil {
+			return
+		}
 		// 偶发抖动重试一次（仍是持续供给，不产生假值）。
 		time.Sleep(100 * time.Millisecond)
 		if oneShot(2) {
@@ -420,6 +427,7 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		// 宁可拿台阶值也不能没有值）—— 但定长循环读数是「每包一跳」的数包台阶值，
 		// 不是真实带宽，回流订阅会拿假速度误导选路。宁缺毋假：失败就不给值。
 		fmt.Fprintf(os.Stderr, "[debug-ul] 持续供给失败，放弃该节点上行（回退保险已移除）\n")
+		uploadAttributionProbe(ctx, s, uuid)
 		return
 	}
 	// ── 定长循环模式（仅回退：显式设了 TAIER_UPLOAD_LEN 才走）──
@@ -437,6 +445,70 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		}
 		if !oneShot(i) {
 			time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
+		}
+	}
+}
+
+// uploadAttributionProbe 在持续供给彻底失败后定位「断在哪一跳」，只打日志不改测速。
+//
+// 背景（2026-10-09 三方对照实验定案）：机场节点链路上传 POST 100% 秒断 RST，
+// 而 runner 直连（S1）与 runner 经 mihomo DIRECT（S2）全部成功 —— 断点在节点隧道内。
+// 但 [debug-ul] 只能看到 loopback 视角的 write RST，无法区分：
+//
+//	节点对 doAnalsLoad.do 一律断 / 节点只限大 Content-Length / 节点隧道本身已死
+//
+// 三个探测各 ≤4s、用独立 context（不随窗口取消）与独立 dummy counter（不污染读数）：
+//
+//	small-proxied : 经 TAIER_SOCKS5/HTTP_PROXY 发 1KB 定长 POST —— RST = 节点对该端点
+//	                一律断；任何 HTTP 响应（含 4xx）= 链路通，断的是大包/持续流
+//	small-direct  : 绕过一切代理直连重放 —— 对照（key 可能因绑定节点出口 IP 而 4xx，
+//	                网络层通断仍是有效信号）
+//	tunnel-get    : 经代理 GET /speed/ —— 区分「节点隧道已死」与「对 POST 挑食」
+func uploadAttributionProbe(ctx context.Context, s Server, uuid string) {
+	pctx, cancel := context.WithTimeout(context.Background(), 16*time.Second)
+	defer cancel()
+	addr := hostPort(s.HostIP, s.Port)
+	dummy := newByteCounter(1)
+	runSmall := func(label string, client *http.Client) {
+		body := &uploadBody{
+			counter:   dummy,
+			prefix:    []byte(fmt.Sprintf("--%s\r\nContent-Disposition: form-data; name=\"upload\";filename=\"attr.%s\"\r\n\r\n", boundary, label)),
+			payload:   make([]byte, 4096),
+			stop:      pctx.Done(),
+			finite:    true,
+			remaining: 1024,
+		}
+		req, err := http.NewRequestWithContext(pctx, http.MethodPost, "http://"+addr+"/speed/doAnalsLoad.do", body)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[debug-ul-attr] %s newreq: %v\n", label, err)
+			return
+		}
+		req.Header.Set("User-Agent", uaUpload)
+		req.Header.Set("Charset", "UTF-8")
+		req.Header.Set("Key", uuid)
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Content-Type", "multipart/form-data;boundary="+boundary)
+		req.ContentLength = 1024
+		resp, err := client.Do(req)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[debug-ul-attr] %s err=%v\n", label, err)
+			return
+		}
+		defer resp.Body.Close()
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 80))
+		fmt.Fprintf(os.Stderr, "[debug-ul-attr] %s status=%d body=%q\n", label, resp.StatusCode, string(b))
+	}
+	runSmall("small-proxied", newHTTPClient(4*time.Second, false))
+	runSmall("small-direct", &http.Client{Timeout: 4 * time.Second,
+		Transport: &http.Transport{DisableKeepAlives: true}})
+	if req, err := http.NewRequestWithContext(pctx, http.MethodGet, "http://"+addr+"/speed/", nil); err == nil {
+		req.Header.Set("User-Agent", uaDalvik)
+		if resp, err := newHTTPClient(4*time.Second, false).Do(req); err == nil {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 80))
+			fmt.Fprintf(os.Stderr, "[debug-ul-attr] tunnel-get status=%d body=%q\n", resp.StatusCode, string(b))
+			resp.Body.Close()
+		} else {
+			fmt.Fprintf(os.Stderr, "[debug-ul-attr] tunnel-get err=%v\n", err)
 		}
 	}
 }
