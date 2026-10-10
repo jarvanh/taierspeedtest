@@ -197,16 +197,14 @@ func (c *byteCounter) snap() int64 { return c.n.Load() }
 // 计数发生在 Read() 里 —— Go 传输层按「对端 TCP 窗口实际能吞多少」来读 body，
 // 链路堵住就不再读，计数自然停在真实进度上（反压直接传导，无本机缓冲放大）。
 // 这比裸 socket 的 Write() 盲写准得多：Write() 返回只代表数据进了本机发送缓冲。
-// uploadBody 作为 HTTP 请求体喂给 http.NewRequest。
-//
-// 计数发生在 Read() 里 —— 走标准反压代理（mihomo HTTP/SOCKS5）时，
-// 传输层按「对端窗口实际能吞多少」来读 body，计数即真实出口速率。
 //
 // 两种模式（finite 区分，绝不能混）：
 //
-//	finite=false：上游谎言模式（Content-Length 900MB，靠 stop 结束）。
-//	  实测经代理会被服务端 RST —— 保留只为对照，默认不用。
-//	finite=true ：真实长度模式，发满即 EOF。⚠️ 曾经的爆表元凶：
+//	finite=false：900MB 谎言持续供给（TAIER_UPLOAD_SUSTAINED=1 的对照模式）。
+//	  读数经机场节点链路 100% 秒断 RST —— 节点网关大 POST 阈值 16MB~128MB
+//	  （2026-10-10 归因探针二分定案，与 CF 免费版 100MB 兼容）；直连正常
+//	  （S1/S2/沙箱实测 125/118/156Mbps），故仅作对照、默认不用。
+//	finite=true ：真实长度模式（默认 8MB/请求，发满即 EOF）。⚠️ 曾经的爆表元凶：
 //	  remaining==0 既是「未初始化的无限模式」又是「已发完」——
 //	  两个语义撞在同一个值上，发完后 Read 掉进无限分支狂计数（实测 72万 Mbps）。
 //	  现用 exhausted 粘性标志彻底分离两个语义。
