@@ -190,6 +190,7 @@ type byteCounter struct {
 func newByteCounter(_ int) *byteCounter { return &byteCounter{} }
 
 func (c *byteCounter) add(n int)   { c.n.Add(int64(n)) }
+func (c *byteCounter) sub(n int)   { c.n.Add(-int64(n)) }
 func (c *byteCounter) snap() int64 { return c.n.Load() }
 
 // uploadBody 作为 HTTP 请求体喂给 http.NewRequest。
@@ -208,6 +209,13 @@ func (c *byteCounter) snap() int64 { return c.n.Load() }
 //	  remaining==0 既是「未初始化的无限模式」又是「已发完」——
 //	  两个语义撞在同一个值上，发完后 Read 掉进无限分支狂计数（实测 72万 Mbps）。
 //	  现用 exhausted 粘性标志彻底分离两个语义。
+//
+// ⚠️ 计数口径（2026-10-10，v1.0.4-jh.12）：Read 计的是「交给传输层」的字节，
+// 半途断连时其中一部分只到了本机/代理缓冲、服务端并没收到 —— 旧实现失败后
+// 「已计数字节不撤销」，这是上行读数仅存的高估源。现改为**确认对账**：
+// 每个 finite 请求记 ownSent，请求失败（非 2xx/3xx / Do 出错）时把 ownSent
+// 从共享 counter 精确扣回（sub），只留服务端确认过的字节。窗口正常结束时
+// 在途请求不扣（那部分反压驱动的字节是真实流出的，见 oneShot 内注释）。
 type uploadBody struct {
 	counter   *byteCounter
 	prefix    []byte
@@ -216,6 +224,12 @@ type uploadBody struct {
 	finite    bool
 	remaining int64
 	exhausted bool
+	// ownSent：本请求从 Read 侧计入共享 counter 的字节数（对账用）。
+	// ⚠️ 必须是原子类型：Read 由 transport 的写协程调用，而服务端**提前响应**
+	// （如 403 早于 body 写完返回）时 oneShot 在 Do 返回后即刻读它——两边无
+	// happens-before，-race 实测会报竞争。
+	// 持续供给模式（finite=false）不记账——那是对照模式，读数语义本就不同。
+	ownSent atomic.Int64
 }
 
 func (b *uploadBody) Read(p []byte) (int, error) {
@@ -240,6 +254,7 @@ func (b *uploadBody) Read(p []byte) (int, error) {
 		b.prefix = b.prefix[n:]
 		b.remaining -= int64(n)
 		b.counter.add(n)
+		b.ownSent.Add(int64(n))
 		if b.remaining == 0 {
 			b.exhausted = true
 		}
@@ -251,6 +266,7 @@ func (b *uploadBody) Read(p []byte) (int, error) {
 	}
 	b.remaining -= int64(n)
 	b.counter.add(n)
+	b.ownSent.Add(int64(n))
 	if b.remaining == 0 {
 		b.exhausted = true
 	}
@@ -392,6 +408,13 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 	// 上行仍会被锁死在「每秒 1 个 1MB 请求」= 8.39Mbps 的量子化台阶上。
 	upClient := newHTTPClient(0, true)
 
+	// 确认台账（v1.0.4-jh.12）：本连接「交给传输层 vs 服务端确认」的对账。
+	// sent=Read 侧计入共享 counter 的字节；confirmed=服务端 2xx/3xx 确认请求的字节；
+	// clawback=失败请求扣回的字节。窗口结束打一行 [debug-ul-ack] ——
+	// ratio 长期 ≈100% 说明读数全部由服务端确认支撑，诚实度可审计。
+	// 持续供给模式（finite=false）不记账，ownSent 恒 0，台账自然不触发。
+	var sentTotal, confirmedTotal, clawedTotal int64
+
 	oneShot := func(idx int) bool {
 		body := &uploadBody{
 			counter: counter,
@@ -417,13 +440,34 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 
 		resp, err := upClient.Do(req)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "[debug-ul] #%d do: %v\n", idx, err)
+			own := body.ownSent.Load()
+			fmt.Fprintf(os.Stderr, "[debug-ul] #%d do: %v sent=%d\n", idx, err, own)
+			// ctx 已取消 = 测速窗口正常结束：在途字节由 TCP 反压驱动、真实流出本机，
+			// 不扣回也不计入确认（它们没有服务端确认，但不属于「造假」）。
+			// ctx 还活着 = 真失败：ownSent 是「服务端没确认收到」的字节，精确扣回
+			// （确认对账口径：只留确认过的，宁缺毋假）。
+			if ctx.Err() == nil && own > 0 {
+				counter.sub(int(own))
+				clawedTotal += own
+			}
 			return false
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		fmt.Fprintf(os.Stderr, "[debug-ul] #%d status=%d body=%q\n", idx, resp.StatusCode, string(b))
-		return resp.StatusCode >= 200 && resp.StatusCode < 400
+		own := body.ownSent.Load()
+		fmt.Fprintf(os.Stderr, "[debug-ul] #%d status=%d body=%q sent=%d\n",
+			idx, resp.StatusCode, string(b), own)
+		sentTotal += own
+		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
+			confirmedTotal += own
+			return true
+		}
+		// 4xx/5xx：服务端明确拒收 —— 读到的字节同样扣回。
+		if own > 0 {
+			counter.sub(int(own))
+			clawedTotal += own
+		}
+		return false
 	}
 
 	// ── 900MB 谎言持续供给（对照模式：TAIER_UPLOAD_SUSTAINED=1 才走）──
@@ -459,8 +503,19 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 	// 为什么不再是"数包台阶"：旧 1MB 小包循环的台阶（8.39Mbps 量子化）根源是
 	// 「包完成事件节拍 + 等确认期间计数停摆」占窗口比例过大；8MB 请求在慢节点
 	// 等效撑满窗口（传输 >> RTT），快节点停摆占比也 ≤20%，中位数读数接近真实。
-	// 失败（服务端 4xx/连接断）退避重试：已计数字节不撤销、不重复造假值，
-	// 窗口内成功请求的真实速率照常进采样。
+	// 失败（服务端 4xx/连接断）退避重试：v1.0.4-jh.12 起失败请求的已计字节**精确
+	// 扣回**（确认对账，见 oneShot 内注释），窗口内成功请求的真实速率照常进采样。
+	// runPhase 对负 delta 钳 0：扣回表现为该采样点 0 速，不会被当成负尖峰。
+	defer func() {
+		if sentTotal > 0 || clawedTotal > 0 {
+			ratio := 100.0
+			if sentTotal > 0 {
+				ratio = float64(confirmedTotal) * 100.0 / float64(sentTotal)
+			}
+			fmt.Fprintf(os.Stderr, "[debug-ul-ack] sent=%d confirmed=%d clawed=%d ratio=%.1f%%\n",
+				sentTotal, confirmedTotal, clawedTotal, ratio)
+		}
+	}()
 	for i := 1; ; i++ {
 		select {
 		case <-ctx.Done():
