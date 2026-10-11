@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -168,4 +169,77 @@ func mustHostPort(t *testing.T, url string) (string, int) {
 		port = port*10 + int(c-'0')
 	}
 	return host, port
+}
+
+// newStallServer 返回「首个请求扣住确认 2s（> 窗口）、其余立即 200」的假测速服务器，
+// 用于区分流水线与单槽同步循环两种形态。
+func newStallServer() *httptest.Server {
+	var seen atomic.Int32
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if seen.Add(1) == 1 {
+			// 首个请求：扣住确认 2s（模拟长 RTT），期间不读 body
+			select {
+			case <-time.After(2 * time.Second):
+			case <-r.Context().Done():
+			}
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+}
+
+// 流水线核心回归（v1.0.4-jh.13）：槽 A 被慢确认挂住时，槽 B 必须持续灌数据——
+// 「等确认空转被另一槽填满」是 67.11 台阶修复的机制本体（2026-10-11 定案：台阶 =
+// 单槽同步循环的请求完成周期与 500ms 采样格整数倍锁定的采样量化伪影）。
+// 判定用 counter 而非请求数：单槽形态下唯一请求被挂住，counter 停在 ≤1×请求量。
+func TestUploadWorkerPipelinePumpsWhileSlotStalled(t *testing.T) {
+	envForUploadTest(t)
+	t.Setenv("TAIER_UPLOAD_LEN", "65536")
+
+	srv := newStallServer()
+	defer srv.Close()
+	host, port := mustHostPort(t, srv.URL)
+
+	counter := newByteCounter(1)
+	stderr := captureStderr(t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		defer cancel()
+		uploadWorker(ctx, Server{HostIP: host, Port: port}, "test-uuid", counter)
+	})
+
+	const reqLen = 65536
+	if got := counter.snap(); got <= 4*reqLen {
+		t.Fatalf("counter=%d ≤ 4×%d：另一槽没有在被挂住期间灌数据（流水线未生效？）\nstderr:\n%s",
+			got, reqLen, stderr)
+	}
+	if !strings.Contains(stderr, "pipeline=true") {
+		t.Fatalf("台账应标注 pipeline=true\nstderr:\n%s", stderr)
+	}
+}
+
+// 逃生门：TAIER_UPLOAD_PIPELINE=0 回退单槽同步循环——同一挂住场景 counter 停在
+// ≤1×请求量（唯一请求在途），与上一条形成对照，钉住回退路径行为。
+func TestUploadWorkerPipelineEscapeHatch(t *testing.T) {
+	envForUploadTest(t)
+	t.Setenv("TAIER_UPLOAD_PIPELINE", "0")
+	t.Setenv("TAIER_UPLOAD_LEN", "65536")
+
+	srv := newStallServer()
+	defer srv.Close()
+	host, port := mustHostPort(t, srv.URL)
+
+	counter := newByteCounter(1)
+	stderr := captureStderr(t, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+		defer cancel()
+		uploadWorker(ctx, Server{HostIP: host, Port: port}, "test-uuid", counter)
+	})
+
+	const reqLen = 65536
+	if got := counter.snap(); got > 2*reqLen {
+		t.Fatalf("单槽回退路径 counter=%d 应 ≤ 2×%d（仅首个请求在途）\nstderr:\n%s",
+			got, reqLen, stderr)
+	}
 }

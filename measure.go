@@ -385,9 +385,12 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 	//   16MB~128MB（与 Cloudflare 免费版 100MB 兼容；行为是直接断连而非 413）。
 	//   而 900MB 谎言持续供给（原默认）在机场节点上 100% 秒断 ⇒ 上行恒 0。
 	// 故默认改为 **8MB 有限长度循环**（阈值下留 2 倍余量）：
-	//   - 单请求 8MB：@1MB/s 慢节点 ≈8s > 窗口剩余，等效撑满窗口，无台阶问题；
-	//     快节点 1~3 个请求/窗口，RTT 停摆占比 ≤20%，中位数读数接近真实。
+	//   - 单请求 8MB：@1MB/s 慢节点 ≈8s > 窗口剩余，等效撑满窗口；
 	//   - 服务端逐个确认（200 = 真实收到），计数与服务端确认挂钩，宁真勿假。
+	//   ⚠️ jh.9~jh.12 注释曾称「快节点 RTT 停摆占比 ≤20%、中位数读数接近真实」——
+	//   只在短 RTT 成立；跨太平洋链路（RTT 350~450ms）实测单槽读数被量化到
+	//   67.11/100.66/134.22 台阶（采样伪影，2026-10-11 定案），jh.13 双槽流水线
+	//   消除空转，见下方「上传循环」注释。
 	// 旧行为保留为对照模式：TAIER_UPLOAD_SUSTAINED=1 → 900MB 谎言持续供给；
 	// TAIER_UPLOAD_LEN=<bytes> → 人工定长循环（原语义不变）。
 	finite := true
@@ -410,12 +413,13 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 
 	// 确认台账（v1.0.4-jh.12）：本连接「交给传输层 vs 服务端确认」的对账。
 	// sent=Read 侧计入共享 counter 的字节；confirmed=服务端 2xx/3xx 确认请求的字节；
-	// clawback=失败请求扣回的字节。窗口结束打一行 [debug-ul-ack] ——
+	// clawed=失败请求扣回的字节。窗口结束打一行 [debug-ul-ack] ——
 	// ratio 长期 ≈100% 说明读数全部由服务端确认支撑，诚实度可审计。
 	// 持续供给模式（finite=false）不记账，ownSent 恒 0，台账自然不触发。
-	var sentTotal, confirmedTotal, clawedTotal int64
+	// ⚠️ jh.13 双槽流水线下两槽并发更新，三个计数器必须原子。
+	var sentTotal, confirmedTotal, clawedTotal atomic.Int64
 
-	oneShot := func(idx int) bool {
+	oneShot := func(slot, idx int, slotUUID string) bool {
 		body := &uploadBody{
 			counter: counter,
 			prefix: []byte(fmt.Sprintf(
@@ -433,7 +437,7 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		}
 		req.Header.Set("User-Agent", uaUpload)
 		req.Header.Set("Charset", "UTF-8")
-		req.Header.Set("Key", uuid)
+		req.Header.Set("Key", slotUUID)
 		req.Header.Set("Cache-Control", "no-cache")
 		req.Header.Set("Content-Type", "multipart/form-data;boundary="+boundary)
 		req.ContentLength = contentLen
@@ -441,31 +445,31 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		resp, err := upClient.Do(req)
 		if err != nil {
 			own := body.ownSent.Load()
-			fmt.Fprintf(os.Stderr, "[debug-ul] #%d do: %v sent=%d\n", idx, err, own)
+			fmt.Fprintf(os.Stderr, "[debug-ul] [%d-%d] do: %v sent=%d\n", slot, idx, err, own)
 			// ctx 已取消 = 测速窗口正常结束：在途字节由 TCP 反压驱动、真实流出本机，
 			// 不扣回也不计入确认（它们没有服务端确认，但不属于「造假」）。
 			// ctx 还活着 = 真失败：ownSent 是「服务端没确认收到」的字节，精确扣回
 			// （确认对账口径：只留确认过的，宁缺毋假）。
 			if ctx.Err() == nil && own > 0 {
 				counter.sub(int(own))
-				clawedTotal += own
+				clawedTotal.Add(own)
 			}
 			return false
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
 		own := body.ownSent.Load()
-		fmt.Fprintf(os.Stderr, "[debug-ul] #%d status=%d body=%q sent=%d\n",
-			idx, resp.StatusCode, string(b), own)
-		sentTotal += own
+		fmt.Fprintf(os.Stderr, "[debug-ul] [%d-%d] status=%d body=%q sent=%d\n",
+			slot, idx, resp.StatusCode, string(b), own)
+		sentTotal.Add(own)
 		if resp.StatusCode >= 200 && resp.StatusCode < 400 {
-			confirmedTotal += own
+			confirmedTotal.Add(own)
 			return true
 		}
 		// 4xx/5xx：服务端明确拒收 —— 读到的字节同样扣回。
 		if own > 0 {
 			counter.sub(int(own))
-			clawedTotal += own
+			clawedTotal.Add(own)
 		}
 		return false
 	}
@@ -475,7 +479,7 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 	// 由 TCP 反压驱动，与下载同源 —— 直连（S1/S2、沙箱 A/B）下读数真实。
 	// ⚠️ 但经机场节点 100% 秒断 RST（阈值探针已定案），线上默认已弃用。
 	if !finite {
-		if oneShot(1) {
+		if oneShot(1, 1, uuid) {
 			return
 		}
 		// ⚠️ ctx 已取消 = 测速窗口正常结束（Do 返回 context canceled），不是失败。
@@ -487,7 +491,7 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		}
 		// 偶发抖动重试一次（仍是持续供给，不产生假值）。
 		time.Sleep(100 * time.Millisecond)
-		if oneShot(2) {
+		if oneShot(2, 2, uuid) {
 			return
 		}
 		// 持续供给彻底失败：直接放弃该节点上行（2026-10-08 定案：移除回退保险）。
@@ -498,33 +502,70 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 		uploadAttributionProbe(ctx, s, uuid)
 		return
 	}
-	// ── 有限长度循环模式（默认路径：8MB/请求，TAIER_UPLOAD_LEN 可覆盖）──
-	// 单请求发满 8MB 即 EOF、服务端确认，立即再发下一个直到窗口结束。
-	// 为什么不再是"数包台阶"：旧 1MB 小包循环的台阶（8.39Mbps 量子化）根源是
-	// 「包完成事件节拍 + 等确认期间计数停摆」占窗口比例过大；8MB 请求在慢节点
-	// 等效撑满窗口（传输 >> RTT），快节点停摆占比也 ≤20%，中位数读数接近真实。
-	// 失败（服务端 4xx/连接断）退避重试：v1.0.4-jh.12 起失败请求的已计字节**精确
-	// 扣回**（确认对账，见 oneShot 内注释），窗口内成功请求的真实速率照常进采样。
-	// runPhase 对负 delta 钳 0：扣回表现为该采样点 0 速，不会被当成负尖峰。
-	defer func() {
-		if sentTotal > 0 || clawedTotal > 0 {
-			ratio := 100.0
-			if sentTotal > 0 {
-				ratio = float64(confirmedTotal) * 100.0 / float64(sentTotal)
+	// ── 上传循环：双槽流水线（v1.0.4-jh.13 起 finite 模式默认）──
+	// 台阶根因（2026-10-11 定案，推翻「机场/CF 配额限速」旧说）：单槽同步循环的
+	// 请求完成周期 = 8MiB 传输 + 1×RTT 确认，跨太平洋链路（RTT 350~450ms）下周期
+	// 0.88~1.38s，与 runPhase 的 500ms 采样格整数倍锁定 → 读数被量化到
+	// 67.11/100.66/134.22 Mbps（= calc(8MiB, 1s/0.75s/0.5s)，与实测档位精确吻合）。
+	// 证据链：非 CF 裸 socks5 直连节点同样撞档（与 Cloudflare 无关）；直连 Azure→
+	// 广州联通周期 0.62s 与采样格失锁，读数连续。双槽流水线维持 2 个在途 POST，
+	// 槽 B 在槽 A 等确认期间持续发送 → 确认空转被填满，计数连续，读数回到该逻辑
+	// 流的持续满窗吞吐。计数点仍在 body.Read()，TCP 反压照常传导，不引入虚高；
+	// 请求尺寸维持 8MiB（节点网关大 POST 阈值 16~128MB、CF 免费版 100MB 之下）。
+	// 失败退避重试；失败请求已计字节精确扣回（jh.12 确认对账，runPhase 对负 delta
+	// 钳 0，扣回表现为采样点 0 速）。TAIER_UPLOAD_PIPELINE=0 回退单槽同步循环。
+	pipeline := true
+	switch os.Getenv("TAIER_UPLOAD_PIPELINE") {
+	case "0", "false", "no", "off":
+		pipeline = false
+	}
+	// 槽 B 独立 enqueue 会话：服务端对同会话并发 POST 有限次拒绝（jh.4 实测同会话
+	// 4 并发 up=0 率 43%），两槽各持会话让服务端看到两个独立用户；enqueue 失败
+	// 回落共享 uuid——失败请求由确认对账扣回兜住，不产生幻影字节。
+	slotUUIDs := [2]string{uuid, uuid}
+	if pipeline && os.Getenv("TAIER_UPLOAD_MULTI_SESSION") != "0" {
+		if u2, err := enqueue(s, makeIMEI(), enqueueBandwidth()); err == nil {
+			slotUUIDs[1] = u2
+			defer dequeue(s, u2)
+		} else {
+			fmt.Fprintf(os.Stderr, "[debug-ul] slot2 enqueue failed, fallback shared: %v\n", err)
+		}
+	}
+	runSlot := func(slot int) {
+		for i := 1; ; i++ {
+			select {
+			case <-ctx.Done():
+				return
+			default:
 			}
-			fmt.Fprintf(os.Stderr, "[debug-ul-ack] sent=%d confirmed=%d clawed=%d ratio=%.1f%%\n",
-				sentTotal, confirmedTotal, clawedTotal, ratio)
+			if !oneShot(slot, i, slotUUIDs[slot-1]) {
+				time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
+			}
+		}
+	}
+	defer func() {
+		st, cf, cl := sentTotal.Load(), confirmedTotal.Load(), clawedTotal.Load()
+		if st > 0 || cl > 0 {
+			ratio := 100.0
+			if st > 0 {
+				ratio = float64(cf) * 100.0 / float64(st)
+			}
+			fmt.Fprintf(os.Stderr, "[debug-ul-ack] sent=%d confirmed=%d clawed=%d ratio=%.1f%% pipeline=%t\n",
+				st, cf, cl, ratio, pipeline)
 		}
 	}()
-	for i := 1; ; i++ {
-		select {
-		case <-ctx.Done():
-			return
-		default:
+	if pipeline {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		for slot := 1; slot <= 2; slot++ {
+			go func(slot int) {
+				defer wg.Done()
+				runSlot(slot)
+			}(slot)
 		}
-		if !oneShot(i) {
-			time.Sleep(100 * time.Millisecond) // 失败退避，防 tight-loop
-		}
+		wg.Wait()
+	} else {
+		runSlot(1)
 	}
 }
 
