@@ -557,12 +557,23 @@ func uploadWorker(ctx context.Context, s Server, uuid string, counter *byteCount
 	if pipeline {
 		var wg sync.WaitGroup
 		wg.Add(2)
-		for slot := 1; slot <= 2; slot++ {
-			go func(slot int) {
-				defer wg.Done()
-				runSlot(slot)
-			}(slot)
+		go func() {
+			defer wg.Done()
+			runSlot(1)
+		}()
+		// 槽 B 延后半个采样格（250ms）启动：两槽同相位会让 8MiB 完成事件叠加成
+		// 16MiB/周期，读数重新锁死在 calc(16MiB, 1s)=134.22（N3 实测两轮同值）；
+		// 错开半格打破相位锁定，读数连续且贴合真实聚合吞吐。
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
 		}
+		timer.Stop()
+		go func() {
+			defer wg.Done()
+			runSlot(2)
+		}()
 		wg.Wait()
 	} else {
 		runSlot(1)
